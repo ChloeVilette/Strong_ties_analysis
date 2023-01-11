@@ -1,0 +1,3791 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+## Load libraries
+
+```{r Libraries}
+library(igraph)
+library(dplyr)
+library(plyr)
+library(lsa)
+library(data.table)
+library(netTS)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+library(brms)
+library(stringr)
+library(Perc)
+```
+
+### Load necessary spatial and grooming data
+
+```{r}
+# Spatial data
+sptl.data<- read.csv("sptl.proxi.csv")
+sptl.data<-sptl.data[,-1]
+sptl.data$Date<- as.Date(sptl.data$Date)
+
+# Grooming data
+groom.data<- read.csv("grooming.data.csv")
+groom.data<-groom.data[,-1]
+groom.data$Date<- as.Date(groom.data$Date)
+```
+
+### EXTRACT MEASURES FOR SPATIAL PROXIMITY DATA
+
+## Extract spatial strong ties - this part takes a long time. This chunk is for you to see how it was done. The next chunk offers your to load the dataset so you don't have to run this chunk.
+
+```{r}
+## dataframes for storage.
+strong_weak_ties_sptl <-data.frame(weight=1, strong=1, dyads="id1 id2", focal= "id2", date = as.Date("2015-01-01"), troop="RST")
+
+windowsize<- days(60)
+windowshift<- days(30)
+
+for ( k in unique(groom.data$TroopID)){
+  
+  ## Select the troop we want 
+  troop.data<- sptl.data %>% filter(TroopID==k)
+  
+  windowstart<-min(troop.data$Date)
+  windowend<-as.Date(windowstart) + windowsize
+  
+  while (as.Date(windowstart) + windowsize <= max(troop.data$Date)){
+    
+    df.subset <- create.window(troop.data, windowstart, windowend)
+    
+    edgelist<- create.an.edgeList(df.subset[,c(1,2)])
+    
+    # individual with interactions present in both: directed = FALSE
+    presence.both <- unique(c(as.character(edgelist$from),as.character(edgelist$to)))
+    prez<-data.frame(ID=presence.both)
+    prez.stat<-merge(prez,status.bis, by="ID", all.x=T)
+    prez.only<-prez.stat%>%filter(sex!=0 | cohort!="A")
+    
+    presence.needed<- prez.only$ID
+    
+    for (each in presence.needed){
+      
+      current.ind <- edgelist%>% filter(from %in% each | to %in% each)
+      
+      if (nrow(current.ind)>=2){
+        
+        current.ind$dyads <- ifelse(as.character(current.ind$from) < as.character(current.ind$to), paste(current.ind$from, current.ind$to), paste(current.ind$to, current.ind$from))
+        
+        non.dire.edgelist<-current.ind%>% dplyr::group_by(dyads)%>% dplyr::summarise (weight=sum(weight))
+        
+        if (nrow(non.dire.edgelist)>1 && sd(non.dire.edgelist$weight)!=0 ){
+          
+          # Extract strong ties       
+          strong.ties <- model_based_strong_ties(non.dire.edgelist$weight, sd_diff = 0, min_diff = 5)
+          
+          # Store measure
+          strong.ties$focal<- each
+          strong.ties$date<- windowstart
+          strong.ties$troop<- k
+          
+          strong.ties <-merge(strong.ties,non.dire.edgelist, by ="weight", all.x=T)
+          strong_weak_ties_sptl<- rbind(strong_weak_ties_sptl,strong.ties)
+          gc()
+        }
+      }
+    }
+    
+    windowend = windowend + windowshift
+    windowstart= as.Date(windowstart)+windowshift
+  }
+}
+
+strong_ties_sptl<- strong_weak_ties_sptl%>% filter(ties !="1")
+strong_ties_sptl$focal<-as.character(strong_ties_sptl$focal)
+
+```
+
+## Load and set up strong ties for spatial data
+
+```{r}
+
+strong_weak_ties_sptl <-read.csv("strong_weak_ties_sptl.csv")
+strong_weak_ties_sptl<-strong_weak_ties_sptl[,-1]
+
+# deal with the dyad column where ID1 is the focal and ID2 is the partner/tie
+
+strong_weak_ties_sptl[c('ID1', 'ID2')] <- str_split_fixed(strong_weak_ties_sptl$dyads, ' ', 2)
+
+for (i in 1:nrow(strong_weak_ties_sptl)){
+  
+  if (strong_weak_ties_sptl[i,"ID1"]==strong_weak_ties_sptl[i,"focal"] ){
+    strong_weak_ties_sptl[i,"tie"]<- strong_weak_ties_sptl[i,"ID2"]
+  }else{
+    strong_weak_ties_sptl[i,"tie"]<- strong_weak_ties_sptl[i,"ID1"]
+  }
+}
+
+strong_weak_ties_sptl<-strong_weak_ties_sptl %>% select(-("dyads"),-("ID1"),-("ID2"))
+strong_weak_ties_sptl<-distinct(strong_weak_ties_sptl)
+
+strong_weak_ties_sptl<- strong_weak_ties_sptl%>% filter(focal!="lisainf14" & focal!="puzzinf16" & focal!="macy" & focal!="needinf16",focal!="cyclinf15" & focal!="cyclinf16" & focal!="doriinf16" & focal!="dottinf16",focal!="ellainf16" & focal!="fayinf15" & focal!="floinf15" & focal!="ginginf16",focal!="hollinf16" & focal!="jasminf15" & focal!="jasminf16" & focal!="laurinf15",focal!="laurinf16" & focal!="layainf15" & focal!="lucyinf15",focal!="lucyinf16" & focal!="phoeinf16" & focal!="saffinf16" & focal!="shuminf15",focal!="valkinf16" & focal!="ubuninf16" & focal!="tearinf16",focal!="cura" & focal!="port" & focal!="swaz")
+
+# Subset with only strong ties.
+strong_ties_sptl<-strong_weak_ties_sptl%>%filter(strong==1)
+
+```
+
+## Add status and whether the strong ties are part of the focal's family.
+
+# Set up attribute dataframes.
+
+```{r}
+name.df<-unique(sptl.data$to)
+
+status.df <-data.frame(ID=name.df,cohort= c("2013","2013","2013","2013","2013","2013","2013", "2013","2014","2014","2014","2014","2014","2014","2014","2014","2014","2013","2013","2013","2013","2014","2012","2015","2015","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","2016","A","2016","2014","2013","2013","2013","2013","2013","2013","2013","2013","2013","2013","2014","2014","2014","2014","2014","2014","2014","2014","2014","2015","2015","2015","2015","2015","2015","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","2015","2015","2015","2015","A","2016","2016","2016","2016","2016","2016","2016","2016","2015","2016","2013","2013","2013","2013","2013","2013","2013","2014","A","2014","2014","2014","2014","2014","2014","2014","2014","2014","2014","2014","2015","2015","2015","2015","2015","2015","2015","2015","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","A","2015", "2015","A","2016", "2016","2016", "2016","2016","A","2015","2016","2016","2016"))
+
+
+sex.df<-data.frame(ID=name.df, sex= c(1,1,0,0,1,1,0,0,1,1,0,1,1,0,0,1,0,0,0,0,0,0,0,0,0,1,0, 1,1,1,0,1,1,1,1,0,1,0,1,1,0,0,1,0,0,0,0,0,0,0,"NA",0,"NA",1,0,0,0,1,0,1,1,1,1,1,1,0,0,1,1,1,0,0,0,1,1,0,0,1,1,1,1,1,1,1,0,0,1,1,0,1,0,1,1,1,0,1,1,0,1,0,0,0,1,1,0,1,0,0,0,"NA","NA","NA",0,"NA",0,0,"NA",1,0,0,0,"NA",1,1,1,1,1,1,0,0,1,0,0,1,1,1,1,1,0,0,0,0,0,1,0,0,1,1,0,1,0,1,1,0,0,0,1,1,1,1,1,1,0,0,1,0,1,0,1,0,1,1,0,0,"NA",1,0,"NA",1,0,0,"NA",0,"NA","NA","NA","NA" ))
+
+
+status.bis<- merge(status.df, sex.df, by="ID", all.x=T)
+```
+
+# associate attributes
+
+```{r}
+colnames(status.bis)<-c("tie", "ties_status", "ties_sex")
+str.ties.sptl.status<-merge(strong_ties_sptl, status.bis, by="tie", all.x=T)
+
+colnames(status.bis)<-c("focal", "focal_status", "focal_sex")
+str.ties.sptl.status2<-merge(str.ties.sptl.status, status.bis, by="focal", all.x=T)
+
+# Get rid of adults and the only individual from the 2012 cohort
+str.ties.sptl.juve<-str.ties.sptl.status2%>% filter(focal_status!="A" &focal_status!="2012")
+str.ties.sptl.juve$focal<-as.character(str.ties.sptl.juve$focal)
+str.ties.sptl.juve$date<- as.Date(str.ties.sptl.juve$date)
+
+```
+
+## is the strong tie from the focal's family? Either yes or no answer.
+
+# first create family list with all our individuals
+
+```{r}
+family.list <- list()
+
+nodes_of_interest_1 <- c("ella","elto","emil","eve", "ellainf16") 
+nodes_of_interest_2 <- c("dottinf16", "dott","dice","dart","deso") 
+nodes_of_interest_3 <- c("pris","peet","podg","port") 
+nodes_of_interest_4 <- c("glit","glue","grub") 
+nodes_of_interest_5 <- c("kins","katn","kumq") 
+nodes_of_interest_6 <- c("pene","prof","pupi")
+nodes_of_interest_7 <- c("tear","timm","trip","torn", "tearinf16") 
+nodes_of_interest_8 <- c("laur","ligh","loki", "laurinf15", "laurinf16")
+nodes_of_interest_9 <- c("arwe","amy","arag")
+nodes_of_interest_10 <- c("laya","leon", "layainf15") 
+nodes_of_interest_11 <- c("tyva","thor","tita") 
+nodes_of_interest_12 <- c("trac","tarz") 
+nodes_of_interest_13 <- c("daff","disn", "damo") 
+nodes_of_interest_14 <- c("brie","band", "bilb") 
+nodes_of_interest_15 <- c("glad","gord", "glac") 
+nodes_of_interest_16 <- c("herm","harr", "howz") 
+nodes_of_interest_17 <- c("lisa","lia", "lisainf14", "luxe") 
+nodes_of_interest_18 <- c("puzz","pumb", "polk", "piec", "puzzinf16") 
+nodes_of_interest_19 <- c("need","nife", "needinf16") 
+nodes_of_interest_20 <- c("turt","tucs") 
+nodes_of_interest_21 <- c("naom","nobo") 
+nodes_of_interest_22 <- c("ruby","rock") 
+nodes_of_interest_23 <- c("phoe","puck", "pean", "pino", "phoeinf16") 
+nodes_of_interest_24 <- c("holl","hect", "hord", "home", "hollinf16")
+nodes_of_interest_25 <- c("shum","shel", "stru", "shuminf15")
+nodes_of_interest_26 <- c("valk","vect", "valkinf16")
+nodes_of_interest_27 <- c("cycl","cube", "cyclinf15", "cyclinf16")
+nodes_of_interest_28 <- c("kels","kiss")
+nodes_of_interest_29 <- c("ubun","unfu","ubuninf16")
+nodes_of_interest_30 <- c("scar","saff", "swee") 
+nodes_of_interest_31 <- c("ging","gizm", "gats", "guge", "ginginf16")
+nodes_of_interest_32 <- c("flo","fina", "floinf15")
+nodes_of_interest_33 <- c("ocea","oreo", "omni", "octo")
+nodes_of_interest_34 <- c("carm","cind", "cact")
+nodes_of_interest_35 <- c("sash","spoc", "socr", "sarg", "swaz")
+nodes_of_interest_36 <- c("fay","fent", "funk", "fayinf15")
+nodes_of_interest_37 <- c("coco","cola", "caba", "cura")
+nodes_of_interest_38 <- c("lucy","lore", "lucyinf15", "lucyinf16")
+nodes_of_interest_39 <- c("dori","daen", "dire", "doriinf16")
+nodes_of_interest_40 <- c("wokb","wolo", "wood")
+nodes_of_interest_41 <- c("jasm","jasminf15", "jasminf16")
+
+family.list[[length(family.list)+1]] <-nodes_of_interest_1
+family.list[[length(family.list)+1]] <-nodes_of_interest_2
+family.list[[length(family.list)+1]] <-nodes_of_interest_3
+family.list[[length(family.list)+1]] <-nodes_of_interest_4
+family.list[[length(family.list)+1]] <-nodes_of_interest_5
+family.list[[length(family.list)+1]] <-nodes_of_interest_6
+family.list[[length(family.list)+1]] <-nodes_of_interest_7
+family.list[[length(family.list)+1]] <-nodes_of_interest_8
+family.list[[length(family.list)+1]] <-nodes_of_interest_9
+family.list[[length(family.list)+1]] <-nodes_of_interest_10
+family.list[[length(family.list)+1]] <-nodes_of_interest_11
+family.list[[length(family.list)+1]] <-nodes_of_interest_12
+family.list[[length(family.list)+1]] <-nodes_of_interest_13
+family.list[[length(family.list)+1]] <-nodes_of_interest_14
+family.list[[length(family.list)+1]] <-nodes_of_interest_15
+family.list[[length(family.list)+1]] <-nodes_of_interest_16
+family.list[[length(family.list)+1]] <-nodes_of_interest_17
+family.list[[length(family.list)+1]] <-nodes_of_interest_18
+family.list[[length(family.list)+1]] <-nodes_of_interest_19
+family.list[[length(family.list)+1]] <-nodes_of_interest_20
+family.list[[length(family.list)+1]] <-nodes_of_interest_21
+family.list[[length(family.list)+1]] <-nodes_of_interest_22
+family.list[[length(family.list)+1]] <-nodes_of_interest_23
+family.list[[length(family.list)+1]] <-nodes_of_interest_24
+family.list[[length(family.list)+1]] <-nodes_of_interest_25
+family.list[[length(family.list)+1]] <-nodes_of_interest_26
+family.list[[length(family.list)+1]] <-nodes_of_interest_27
+family.list[[length(family.list)+1]] <-nodes_of_interest_28
+family.list[[length(family.list)+1]] <-nodes_of_interest_29
+family.list[[length(family.list)+1]] <-nodes_of_interest_30
+family.list[[length(family.list)+1]] <-nodes_of_interest_31
+family.list[[length(family.list)+1]] <-nodes_of_interest_32
+family.list[[length(family.list)+1]] <-nodes_of_interest_33
+family.list[[length(family.list)+1]] <-nodes_of_interest_34
+family.list[[length(family.list)+1]] <-nodes_of_interest_35
+family.list[[length(family.list)+1]] <-nodes_of_interest_36
+family.list[[length(family.list)+1]] <-nodes_of_interest_37
+family.list[[length(family.list)+1]] <-nodes_of_interest_38
+family.list[[length(family.list)+1]] <-nodes_of_interest_39
+family.list[[length(family.list)+1]] <-nodes_of_interest_40
+family.list[[length(family.list)+1]] <-nodes_of_interest_41
+```
+
+# then extract
+
+```{r}
+
+for (i in 1:nrow(str.ties.sptl.juve)){
+  
+  id<-str.ties.sptl.juve[i, "focal"]
+  fam.nb<-grep(id, family.list)
+  nodes_family<- family.list[[fam.nb]] 
+  
+  if(str.ties.sptl.juve[i, "tie"] %in% nodes_family){
+    str.ties.sptl.juve[i, "is.tie.fam"]<-1
+  } else{
+    str.ties.sptl.juve[i, "is.tie.fam"]<-0
+  }
+}
+
+```
+
+## Within strong ties, extract the proportion of group members to which juveniles are exposed
+
+```{r}
+rate.values.df <- data.frame(focal="id", rate.adult=1, rate.juve=1, rate.family=1, rate.nonfamily=1, date=as.Date("2015-01-01"), troop="PT")
+
+temp.df<-data.frame(focal="id", rate.adult=1, rate.juve=1, rate.family=1, rate.nonfamily=1, date=as.Date("2015-01-01"))
+
+for (each in unique(str.ties.sptl.juve$focal)){
+  
+  sub.id<- str.ties.sptl.juve%>% filter(focal==each)
+  rate.adult<-NA
+  rate.juve<-NA
+  rate.family<-NA
+  rate.nonfamily<- NA
+  
+  for ( i in 1:length(unique(sub.id$date))){
+    
+    date_nb<-unique(sub.id$date)[i]
+    sub.id.date<- sub.id %>% filter(date ==date_nb)
+    
+    # Extract the family of interest
+    sub.id.fam<-sub.id.date %>% filter(is.tie.fam==1)
+    
+    if(nrow(sub.id.fam)>0 ){
+      
+      rate.family<- sum(as.numeric(sub.id.fam$weight)) / sum(sub.id.date$weight)
+      rate.nonfamily<-1-rate.family
+      
+    }else{
+      rate.family<-0
+      rate.nonfamily<-1
+    }
+    
+    # get the adult/juve proportion
+    sub.id.adult<-sub.id.date %>% filter(ties_status=="A")
+    
+    if(nrow(sub.id.adult)>0){
+      rate.adult<- sum(as.numeric(sub.id.adult$weight))/ sum(sub.id.date$weight)
+      rate.juve<-1-rate.adult 
+      
+    }else{
+      rate.adult<-0
+      rate.juve<-1
+    }
+    
+    obs.values<-data.frame(cbind(focal=each,  rate.adult=rate.adult, rate.juve=rate.juve,rate.family=rate.family, rate.nonfamily=rate.nonfamily))
+    
+    def.value<-cbind(obs.values ,data.frame(date= date_nb))
+    temp.df<-rbind(temp.df, def.value)
+  }
+  
+  def.value2<-cbind(temp.df , data.frame(troop= as.character(sub.id[1,"troop"])))
+  rate.values.df<-rbind(rate.values.df, def.value2)
+  temp.df<-data.frame(focal="id", rate.adult=1, rate.juve=1, rate.family=1, rate.nonfamily=1, date=as.Date("2015-01-01"))
+}
+
+rate.values.df<-rate.values.df%>%filter(focal !="id")
+
+rate.sptl.df<-reshape2::melt(rate.values.df, id = c("focal","date","troop"))
+```
+
+## Trim our measures so that all individuals within the same cohort appear in the dataset at the same time.
+
+```{r}
+### Extract date at which juvenile appear first
+df.appear <-data.frame(matrix(NA,ncol=3, nrow=))
+colnames(df.appear)<-c("ID", "appear", "gone")
+df.appear$appear<-ymd(df.appear$appear)
+df.appear$gone<-ymd(df.appear$gone)
+
+names.kept<-unique(sptl.data$from)
+
+for (i in 1:length(names.kept)) {
+  
+  df.temp <- sptl.data %>% filter(from == names.kept[i] |   to == names.kept[i])
+  min.date <- min(df.temp$Date)
+  max.date <- max(df.temp$Date)
+  temp.df<- data.frame(ID=names.kept[i],appear=min.date, gone=max.date )
+  df.appear <- rbind(df.appear, temp.df)
+}
+
+df.appear <- df.appear[-1,]
+
+colnames(status.df)<- c("ID", "cohort")
+df.appearance1<-merge(df.appear, status.df, by="ID")
+
+# Attribute mid june as the appearing date for the 2013 and 2014 cohorts. The 2015 cohort started being collected beginning of october 2016.
+
+cohort14<-df.appearance1%>% filter(cohort=="2014")
+cohort15<-df.appearance1%>% filter(cohort=="2015")
+cohort.rest<-df.appearance1%>% filter(cohort!="2014" & cohort!="2015")
+cohort.rest$appear<-ymd("2014-06-10")
+cohort14$appear<-ymd("2015-06-01")
+cohort15$appear<-ymd("2016-10-01")
+
+df.appearance<- rbind(cohort.rest,cohort14,cohort15)
+
+# build triming function
+trim_nodes <- function (nodevalues, data) {
+  
+  names.kept <- unique (nodevalues$focal)
+  df.trim <-data.frame(matrix(NA,ncol=5, nrow=))
+  colnames(df.trim) <-c(colnames(nodevalues))
+  df.trim$date<-ymd(df.trim$date)
+  
+  for (i in 1:length(names.kept)) {
+    
+    df.temp <- data %>% filter(ID == names.kept[i])
+    
+    min.date <- df.temp[,"appear"]
+    df.temp2 <- nodevalues %>% filter (focal==names.kept[i])
+    df.temp2$windowend <- df.temp2$date + days(60)
+    
+    df.temp2[, "value"] <- ifelse(df.temp2[, "date"] < min.date,   NA, df.temp2[, "value"])
+    df.trim <- rbind(df.trim, df.temp2[,c(1:5)])
+  }
+  df.trim <- df.trim[-1,]
+  
+  return(df.trim)
+}
+
+rate.sptl.t<-trim_nodes(rate.sptl.df, df.appearance)
+rate.sptl.t<-rate.sptl.t[complete.cases(rate.sptl.t),]
+
+```
+
+## Extract age
+
+# load birth data
+
+```{r}
+birth.df<- read.csv("birth.df.csv")
+colnames(birth.df)[2]<- "birth"
+birth.df$birth<- dmy(birth.df$birth)
+```
+
+# get age
+
+```{r}
+age.node<-data.frame(ID="pouit", age=1,  date = as.Date("2015-01-01"), troop="pouit")
+colnames(rate.sptl.t)[1]<-"ID"
+
+for (each in 1:nrow(rate.sptl.t)){
+  
+  date.sub<-rate.sptl.t[each,]
+  
+  age.df<-data.frame(ID="pouit", age=1, date = as.Date("2015-01-01"), troop="pouit")
+  age.df$ID<- date.sub[1,"ID"]
+  birth.ID<-birth.df%>% filter(ID == as.character(date.sub[1,"ID"]))
+  
+  if(is.na(birth.ID[,"birth"])==FALSE){
+    
+    age.df$age<-as.numeric(ymd(date.sub[1,"date"]) - birth.ID[1,"birth"]) +1
+    
+  } else{
+    
+    age.df$age<-NA
+  }
+  
+  age.df$date<- date.sub[1,"date"]
+  age.df$troop<- date.sub[1,"troop"]  
+  
+  age.node<- rbind(age.node, age.df)
+}
+age.node<-age.node%>% filter(ID!="pouit")
+
+rate.sptl.t2<-merge(rate.sptl.t,age.node, by =c("ID", "date", "troop"), all.x=T)
+rate.sptl.t2<-distinct(rate.sptl.t2)
+```
+
+## Extract number of scans
+
+```{r}
+# get storage ready
+scan.nb.df<- data.frame(matrix(NA,ncol=3))
+colnames(scan.nb.df)<- c("scan_nb","troop", "date")
+scan.nb.df$date<- as.Date(scan.nb.df$date)
+
+temp.df<- data.frame(matrix(NA,ncol=3))
+colnames(temp.df)<- c("scan_nb","troop", "date")
+temp.df$date<- as.Date(temp.df$date)
+
+for (l in unique(sptl.data$TroopID)){
+  
+  # select the troop 
+  troop.data <-sptl.data%>% filter(TroopID==l)
+  windowstart<- min(troop.data$Date)
+  windowend <- windowstart+ windowsize
+  
+  while (windowstart + windowsize <= max(troop.data$Date)) {
+    
+    window.df <-create.window(troop.data, windowstart, windowend)
+    
+    temp.df$troop<-l
+    temp.df$date<-as.Date(windowstart)
+    temp.df$scan_nb<-length(unique(window.df$Scan))
+    scan.nb.df<-rbind(scan.nb.df,temp.df)
+    
+    windowend = windowend + windowshift
+    windowstart= windowstart+ windowshift
+  }
+}
+
+scan.nb.df<-scan.nb.df[-1,]
+
+# merge with within spatial cosine
+rate.sptl.t3<- merge(rate.sptl.t2, scan.nb.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute troop number
+
+```{r}
+troop.size <- read.csv("troop.size.csv")
+troop.size<-troop.size[,-1]
+
+rate.sptl.t4<-merge(rate.sptl.t3,troop.size, by =c("date", "troop"), all.x=T)
+
+```
+
+## Attribute sex and cohort of the focal 
+
+```{r}
+colnames(status.bis)<-c("ID", "cohort", "sex")
+rate.sptl.status<-merge(rate.sptl.t4, status.bis, by="ID", all.x=T)
+```
+
+## Attribute the identity of the focal's mother
+
+```{r}
+mumid.df<- read.csv("mother_id.csv")
+mumid.df<-mumid.df[,-1]
+
+rate.sptl.status2 <-merge(rate.sptl.status,mumid.df, by ="ID", all.x=T)
+```
+
+## Attribute ndvi
+
+```{r}
+ndvi.df<-read.csv("ndvi.df.csv")
+ndvi.df<-ndvi.df[,-1]
+
+rate.sptl.status3 <-merge(rate.sptl.status2, ndvi.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Extract rank of the focal
+
+# Import dominance data
+
+```{r}
+## Import dominance data
+Dominance <- read.csv("dominance.df.csv")
+colnames(Dominance)[1]<-"date"
+Dominance$date<-as.Date(Dominance$date)
+```
+
+# Rank extraction
+
+```{r}
+data.rank.df<- data.frame()
+
+windowsize<-days(60)
+windowshift<- days(30)
+
+for (i in unique (Dominance$Troop)){
+  
+  df.troop<- Dominance %>% filter(Troop==i)
+  
+  ## Select the troop
+  troop.data<- rate.sptl.status3 %>% filter(troop==i)
+  
+  windowstart<- min(troop.data$date) - days(120) # use 4 months as a burn in period.
+  
+  windowend<-windowstart + windowsize
+  
+  while (windowstart + windowsize <= max(troop.data$date)){
+    
+    df.subset <- create.window(df.troop[,c(3,4,1,2,5:8)], windowstart, windowend)
+    
+    winner.loser.data<- df.subset[,c("winner","loser")]
+    winner.loser.data$winner<-as.character(winner.loser.data$winner)
+    winner.loser.data$loser<-as.character(winner.loser.data$loser)
+    
+    data.matrix <- as.conflictmat(winner.loser.data, weighted=FALSE)
+    
+    # indirect pathways of a particular length (defined by maxLength): length 2
+    DominanceProbabilityLength2 <- conductance(data.matrix, maxLength = 2)
+    
+    # find simRankOrder: length 2
+    s.rank.length2 <- simRankOrder(DominanceProbabilityLength2$p.hat, num = 10, kmax = 100)
+    
+    ranks.certainty <- individualDomProb(DominanceProbabilityLength2$p.hat)
+    
+    data.all<-merge(ranks.certainty,s.rank.length2$BestSimulatedRankOrder, by="ID", all=T)
+    data.all$troop<-i
+    data.all$Date<-windowstart
+    data.rank.df<-rbind.fill(data.rank.df,data.all)
+    
+    windowend = windowend + windowshift
+    windowstart= windowstart+windowshift
+  }
+}
+
+colnames(data.rank.df)[1]<-"ID"
+colnames(data.rank.df)[6]<-"date"
+
+#associate rank to the juvenile ID
+rate.sptl.status4<-merge(rate.sptl.status3,data.rank.df, by=c("ID", "date", "troop"), all.x=TRUE)
+
+# associate rank to the mother ID
+colnames(data.rank.df)[1]<-"mumID"
+rate.sptl.status5<-merge(rate.sptl.status4,data.rank.df, by=c("mumID", "date", "troop"), all.x=TRUE)
+
+rate.sptl.f<-rate.sptl.status5[,-c(13,14,16,17)] # get rid of the unnecessary columns
+colnames(rate.sptl.f)[13]<-"rank_juve"
+colnames(rate.sptl.f)[14]<-"rank_mum"
+```
+
+## Extract degree
+
+```{r}
+
+degree.values.sptl<-data.frame(matrix(NA, ncol= length(unique(str.ties.sptl.juve$tie))+2)) 
+colnames(degree.values.sptl)<- unique(str.ties.sptl.juve$tie)
+colnames(degree.values.sptl)[125:126]<-c( "troop","date") 
+degree.values.sptl$date<-as.Date(degree.values.sptl$date)
+
+for (l in unique(str.ties.sptl.juve$troop)){
+  
+  # select the troop 
+  troop.data <-str.ties.sptl.juve%>% filter(troop==l)
+  
+  for ( i in 1:length(unique(troop.data$date))){
+    
+    date_nb<-unique(troop.data$date)[i]
+    
+    df.subset <- troop.data%>%filter(date==date_nb)
+    nodes_of_interest <- unique (c(df.subset$focal, df.subset$tie))
+    
+    net<- create.a.network(df.subset, directed=FALSE)
+    ind.degree<-data.frame(t(igraph::degree(net)))
+    ind.degree$troop<-l
+    ind.degree$date<-date_nb
+    
+    degree.values.sptl<-plyr::rbind.fill(degree.values.sptl,ind.degree)
+    
+  }
+}
+
+degree.values.sptl<-degree.values.sptl[-1,]
+
+data.long.degree.sptl <- reshape2::melt(degree.values.sptl, id = c("date", "troop"))
+names(data.long.degree.sptl)[names(data.long.degree.sptl) == "variable"] <- "ID"
+names(data.long.degree.sptl)[names(data.long.degree.sptl) == "value"] <- "degree"
+
+# Trim our values
+trim_nodes <- function (nodevalues, data) {
+  
+  names.kept <- unique (nodevalues$ID)
+  df.trim <-data.frame(matrix(NA,ncol=4, nrow=))
+  colnames(df.trim) <-c(colnames(nodevalues))
+  df.trim$date<-ymd(df.trim$date)
+  
+  for (i in 1:length(names.kept)) {
+    
+    df.temp <- data %>% filter(ID == names.kept[i])
+    
+    min.date <- df.temp[,"appear"]
+    df.temp2 <- nodevalues %>% filter (ID==names.kept[i])
+    df.temp2$windowend <- df.temp2$date + days(60)
+    
+    df.temp2[, "degree"] <- ifelse(df.temp2[, "date"] < min.date,   NA, df.temp2[, "degree"])
+    df.trim <- rbind(df.trim, df.temp2[,c(1:4)])
+  }
+  df.trim <- df.trim[-1,]
+  
+  return(df.trim)
+}
+
+degree.sptl.t<-trim_nodes(data.long.degree.sptl, df.appearance)
+degree.sptl.t<-degree.sptl.t[complete.cases(degree.sptl.t),]
+```
+
+## Extract age
+
+```{r}
+age.node<-data.frame(ID="pouit", age=1,  date = as.Date("2015-01-01"), troop="pouit")
+
+for (each in 1:nrow(degree.sptl.t)){
+  
+  date.sub<-degree.sptl.t[each,]
+  
+  age.df<-data.frame(ID="pouit", age=1, date = as.Date("2015-01-01"), troop="pouit")
+  age.df$ID<- date.sub[1,"ID"]
+  birth.ID<-birth.df%>% filter(ID == as.character(date.sub[1,"ID"]))
+  
+  if(is.na(birth.ID[,"birth"])==FALSE){
+    
+    age.df$age<-as.numeric(ymd(date.sub[1,"date"]) - birth.ID[1,"birth"]) +1
+    
+  } else{
+    
+    age.df$age<-NA
+  }
+  
+  age.df$date<- date.sub[1,"date"]
+  age.df$troop<- date.sub[1,"troop"]  
+  
+  age.node<- rbind(age.node, age.df)
+}
+age.node<-age.node%>% filter(ID!="pouit")
+
+degree.sptl.t2<-merge(degree.sptl.t,age.node, by =c("ID", "date", "troop"), all.x=T)
+degree.sptl.t2<-distinct(degree.sptl.t2)
+```
+
+## Attribute number of scans
+
+```{r}
+degree.sptl.t3<- merge(degree.sptl.t2, scan.nb.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute troop number
+
+```{r}
+degree.sptl.t4<-merge(degree.sptl.t3,troop.size, by =c("date", "troop"), all.x=T)
+```
+
+## Attribute sex and cohort of the focal 
+
+```{r}
+degree.sptl.status<-merge(degree.sptl.t4, status.bis, by="ID", all.x=T)
+```
+
+## Attribute the identity of the focal's mother
+
+```{r}
+degree.sptl.status2 <-merge(degree.sptl.status,mumid.df, by ="ID", all.x=T)
+```
+
+## Attribute ndvi
+
+```{r}
+degree.sptl.status3 <-merge(degree.sptl.status2, ndvi.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute rank of the focal
+
+```{r}
+colnames(data.rank.df)[1]<-"ID"
+
+#associate rank to the juvenile ID
+degree.sptl.status4<-merge(degree.sptl.status3,data.rank.df, by=c("ID", "date", "troop"), all.x=TRUE)
+
+# associate rank to the mother ID
+colnames(data.rank.df)[1]<-"mumID"
+degree.sptl.status5<-merge(degree.sptl.status4,data.rank.df, by=c("mumID", "date", "troop"), all.x=TRUE)
+
+
+degree.sptl.f<-degree.sptl.status5[,-c(13,12,16,15)] # get rid of the unnecessary columns
+colnames(degree.sptl.f)[12]<-"rank_juve"
+colnames(degree.sptl.f)[13]<-"rank_mum"
+```
+
+## Extract strength
+
+```{r}
+# set strength function
+strength <- function (net) {
+  strength <-igraph::strength(net, mode=c("all"))
+  return(strength)
+}
+
+str.values.sptl<-data.frame(matrix(NA, ncol= length(unique(str.ties.sptl.juve$tie))+2)) 
+colnames(str.values.sptl)<- unique(str.ties.sptl.juve$tie)
+colnames(str.values.sptl)[125:126]<-c( "troop","date") 
+str.values.sptl$date<-as.Date(str.values.sptl$date)
+
+for (l in unique(str.ties.sptl.juve$troop)){
+  
+  # select the troop 
+  troop.data <-str.ties.sptl.juve%>% filter(troop==l)
+  
+  for (i in 1:length(unique(troop.data$date))){
+    
+    date.df<- troop.data%>% filter(date==unique(troop.data$date)[i])
+    nodes_of_interest <- unique (c(date.df$focal, date.df$tie))
+    
+    net<- create.a.network(date.df, directed=FALSE)
+    ind.str<-data.frame(t(strength(net)))
+    ind.str$troop<-l
+    ind.str$date<-as.Date(unique(troop.data$date)[i])
+    
+    str.values.sptl<-plyr::rbind.fill(str.values.sptl,ind.str)
+    
+  }
+}
+
+str.values.sptl<-str.values.sptl[-1,]
+
+data.long.str.sptl <- reshape2::melt(str.values.sptl, id = c("date", "troop"))
+names(data.long.str.sptl)[names(data.long.str.sptl) == "variable"] <- "ID"
+names(data.long.str.sptl)[names(data.long.str.sptl) == "value"] <- "strength"
+
+# Trim our values
+trim_nodes <- function (nodevalues, data) {
+  
+  names.kept <- unique (nodevalues$ID)
+  df.trim <-data.frame(matrix(NA,ncol=4, nrow=))
+  colnames(df.trim) <-c(colnames(nodevalues))
+  df.trim$date<-ymd(df.trim$date)
+  
+  for (i in 1:length(names.kept)) {
+    
+    df.temp <- data %>% filter(ID == names.kept[i])
+    
+    min.date <- df.temp[,"appear"]
+    df.temp2 <- nodevalues %>% filter (ID==names.kept[i])
+    df.temp2$windowend <- df.temp2$date + days(60)
+    
+    df.temp2[, "strength"] <- ifelse(df.temp2[, "date"] < min.date,   NA, df.temp2[, "strength"])
+    df.trim <- rbind(df.trim, df.temp2[,c(1:4)])
+  }
+  df.trim <- df.trim[-1,]
+  
+  return(df.trim)
+}
+
+str.sptl.t<-trim_nodes(data.long.str.sptl, df.appearance)
+str.sptl.t<-str.sptl.t[complete.cases(str.sptl.t),]
+
+```
+
+## Extract age
+
+```{r}
+age.node<-data.frame(ID="pouit", age=1,  date = as.Date("2015-01-01"), troop="pouit")
+
+for (each in 1:nrow(str.sptl.t)){
+  
+  date.sub<-str.sptl.t[each,]
+  
+  age.df<-data.frame(ID="pouit", age=1, date = as.Date("2015-01-01"), troop="pouit")
+  age.df$ID<- date.sub[1,"ID"]
+  birth.ID<-birth.df%>% filter(ID == as.character(date.sub[1,"ID"]))
+  
+  if(is.na(birth.ID[,"birth"])==FALSE){
+    
+    age.df$age<-as.numeric(ymd(date.sub[1,"date"]) - birth.ID[1,"birth"]) +1
+    
+  } else{
+    
+    age.df$age<-NA
+  }
+  
+  age.df$date<- date.sub[1,"date"]
+  age.df$troop<- date.sub[1,"troop"]  
+  
+  age.node<- rbind(age.node, age.df)
+}
+age.node<-age.node%>% filter(ID!="pouit")
+
+str.sptl.t2<-merge(str.sptl.t,age.node, by =c("ID", "date", "troop"), all.x=T)
+str.sptl.t2<-distinct(str.sptl.t2)
+```
+
+## Attribute number of scans
+
+```{r}
+str.sptl.t3<- merge(str.sptl.t2, scan.nb.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute troop number
+
+```{r}
+str.sptl.t4<-merge(str.sptl.t3,troop.size, by =c("date", "troop"), all.x=T)
+```
+
+## Attribute sex and cohort of the focal 
+
+```{r}
+str.sptl.status<-merge(str.sptl.t4, status.bis, by="ID", all.x=T)
+```
+
+## Attribute the identity of the focal's mother
+
+```{r}
+str.sptl.status2 <-merge(str.sptl.status,mumid.df, by ="ID", all.x=T)
+```
+
+## Attribute ndvi
+
+```{r}
+str.sptl.status3 <-merge(str.sptl.status2, ndvi.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute rank of the focal
+
+```{r}
+colnames(data.rank.df)[1]<-"ID"
+
+#associate rank to the juvenile ID
+str.sptl.status4<-merge(str.sptl.status3,data.rank.df, by=c("ID", "date", "troop"), all.x=TRUE)
+
+# associate rank to the mother ID
+colnames(data.rank.df)[1]<-"mumID"
+str.sptl.status5<-merge(str.sptl.status4,data.rank.df, by=c("mumID", "date", "troop"), all.x=TRUE)
+
+
+str.sptl.f<-str.sptl.status5[,-c(13,12,16,15)] # get rid of the unnecessary columns
+colnames(str.sptl.f)[12]<-"rank_juve"
+colnames(str.sptl.f)[13]<-"rank_mum"
+```
+
+## Extract cosine similarity
+
+```{r}
+## dataframes for storage.
+cosine.sptl <-  data.frame(ID=as.character("pouit"), cosine=1, date = as.Date("2015-01-01"), troop="RST")
+
+windowsize<- days(60)
+windowshift<- days(30)
+
+for ( k in unique(str.ties.sptl.juve$troop)){
+  
+  ## Select the troop we want 
+  troop.data<- str.ties.sptl.juve %>% filter(troop==k)
+  
+  edgelist.previous<-data.frame()
+  
+  for ( i in 1:length(unique(troop.data$date))){
+    # i<-2
+    date_nb<-unique(troop.data$date)[i]
+    
+    df.subset <- troop.data%>%filter(date==date_nb)
+    
+    if(nrow(df.subset)>0 & nrow(edgelist.previous)>0){
+      
+      # individual with interactions present in both: directed = FALSE
+      list.prev<- unique(c(as.character(edgelist.previous$focal),as.character(edgelist.previous$ties)))
+      list.current<- unique(c(as.character(df.subset$focal),as.character(df.subset$tie)))
+      
+      presence.indi <-unique(list.prev[list.prev %in% list.current])
+      presence.indi2<-unique(list.current[list.current %in% list.prev])
+      presence.both<- unique(c(presence.indi,presence.indi2))
+      
+      if (length(presence.both)>0){
+        
+        for (each in presence.both){
+          # each<-"band"
+          cos.node.sptl<-data.frame(ID="pouit", cosine=1,date = as.Date ("2015-01-01"), troop="RST")
+          
+          # if directed = FALSE
+          current.ind <- df.subset%>% filter(focal %in% each | tie %in% each)
+          previous.ind <- edgelist.previous%>% filter(focal %in% each | tie %in% each)
+          
+          current.ind$dyads <- ifelse(as.character(current.ind$focal) < as.character(current.ind$tie), paste(current.ind$focal, current.ind$tie), paste(current.ind$tie, current.ind$focal))
+          current.edgelist<-current.ind%>% dplyr::group_by(dyads)%>% dplyr::summarise(weight.bis=sum(weight))
+          
+          previous.ind$dyads <- ifelse(as.character(previous.ind$focal) < as.character(previous.ind$tie), paste(previous.ind$focal, previous.ind$tie), paste(previous.ind$tie, previous.ind$focal))
+          
+          prev.edgelist<-previous.ind%>% dplyr::group_by(dyads)%>% dplyr::summarise(weight.bis=sum(weight))
+          edgelists<-merge(current.edgelist,prev.edgelist, by=c("dyads"), all=TRUE)
+          edgelists[is.na(edgelists)] <- 0
+          cosine.node<-lsa::cosine((edgelists$weight.bis.x), (edgelists$weight.bis.y))
+          
+          # Store measure
+          cos.node.sptl$ID<- each
+          cos.node.sptl$cosine<-cosine.node
+          cos.node.sptl$date<- date_nb
+          cos.node.sptl$troop<- k
+          cosine.sptl<- rbind(cosine.sptl,cos.node.sptl)
+          
+        }
+      }
+    }
+    edgelist.previous<- df.subset
+  }
+}
+cosine.sptl<- cosine.sptl%>% filter(ID !="pouit")
+
+
+### Just like with the previous measure, we trim our values
+
+trim_nodes <- function (nodevalues, data) {
+  
+  names.kept <- unique (nodevalues$ID)
+  df.trim <-data.frame(matrix(NA,ncol=4, nrow=))
+  colnames(df.trim) <-c(colnames(nodevalues))
+  df.trim$date<-ymd(df.trim$date)
+  
+  for (i in 1:length(names.kept)) {
+    
+    df.temp <- data %>% filter(ID == names.kept[i])
+    
+    min.date <- df.temp[,"appear"]
+    df.temp2 <- nodevalues %>% filter (ID==names.kept[i])
+    df.temp2$windowend <- df.temp2$date + days(60)
+    
+    df.temp2[, "cosine"] <- ifelse(df.temp2[, "date"] < min.date,   NA, df.temp2[, "cosine"])
+    df.trim <- rbind(df.trim, df.temp2[,c(1:4)])
+  }
+  df.trim <- df.trim[-1,]
+  
+  return(df.trim)
+}
+
+cosine.sptl.t<-trim_nodes(cosine.sptl, df.appearance)
+```
+
+## Extract age
+
+```{r}
+age.node<-data.frame(ID="pouit", age=1,  date = as.Date("2015-01-01"), troop="pouit")
+
+for (each in 1:nrow(cosine.sptl.t)){
+  
+  date.sub<-cosine.sptl.t[each,]
+  
+  age.df<-data.frame(ID="pouit", age=1, date = as.Date("2015-01-01"), troop="pouit")
+  age.df$ID<- date.sub[1,"ID"]
+  birth.ID<-birth.df%>% filter(ID == as.character(date.sub[1,"ID"]))
+  
+  if(is.na(birth.ID[,"birth"])==FALSE){
+    
+    age.df$age<-as.numeric(ymd(date.sub[1,"date"]) - birth.ID[1,"birth"]) +1
+    
+  } else{
+    
+    age.df$age<-NA
+  }
+  
+  age.df$date<- date.sub[1,"date"]
+  age.df$troop<- date.sub[1,"troop"]  
+  
+  age.node<- rbind(age.node, age.df)
+}
+age.node<-age.node%>% filter(ID!="pouit")
+
+cosine.sptl.t2<-merge(cosine.sptl.t,age.node, by =c("ID", "date", "troop"), all.x=T)
+
+```
+
+## Attribute number of scans
+
+```{r}
+cosine.sptl.t3<- merge(cosine.sptl.t2, scan.nb.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute troop number
+
+```{r}
+cosine.sptl.t4<-merge(cosine.sptl.t3,troop.size, by =c("date", "troop"), all.x=T)
+```
+
+## Attribute sex and cohort of the focal 
+
+```{r}
+colnames(status.bis)<-c("ID", "cohort", "sex")
+cos.sptl.status<-merge(cosine.sptl.t4, status.bis, by="ID", all.x=T)
+```
+
+## Attribute the identity of the focal's mother
+
+```{r}
+cos.sptl.status2 <-merge(cos.sptl.status,mumid.df, by ="ID", all.x=T)
+```
+
+## Attribute ndvi
+
+```{r}
+cos.sptl.status3 <-merge(cos.sptl.status2, ndvi.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Extract rank of the focal
+
+```{r}
+cos.rank.df<- data.frame()
+
+windowsize<-days(60)
+windowshift<- days(30)
+
+for (i in unique (Dominance$Troop)){
+  
+  df.troop<- Dominance %>% filter(Troop==i)
+  
+  ## Select the troop
+  troop.data<- cos.sptl.status3 %>% filter(troop==i)
+  
+  windowstart<- min(troop.data$date) - days(120) # use 4 months as a burn in period.
+  
+  windowend<-windowstart + windowsize
+  
+  while (windowstart + windowsize <= max(troop.data$date)){
+    
+    df.subset <- create.window(df.troop[,c(3,4,1,2,5:8)], windowstart, windowend)
+    
+    winner.loser.data<- df.subset[,c("winner","loser")]
+    winner.loser.data$winner<-as.character(winner.loser.data$winner)
+    winner.loser.data$loser<-as.character(winner.loser.data$loser)
+    
+    data.matrix <- as.conflictmat(winner.loser.data, weighted=FALSE)
+    
+    # indirect pathways of a particular length (defined by maxLength): length 2
+    DominanceProbabilityLength2 <- conductance(data.matrix, maxLength = 2)
+    
+    # find simRankOrder: length 2
+    s.rank.length2 <- simRankOrder(DominanceProbabilityLength2$p.hat, num = 10, kmax = 100)
+    
+    ranks.certainty <- individualDomProb(DominanceProbabilityLength2$p.hat)
+    
+    data.all<-merge(ranks.certainty,s.rank.length2$BestSimulatedRankOrder, by="ID", all=T)
+    data.all$troop<-i
+    data.all$Date<-windowstart
+    cos.rank.df<-rbind.fill(cos.rank.df,data.all)
+    
+    windowend = windowend + windowshift
+    windowstart= windowstart+windowshift
+  }
+  
+}
+
+colnames(cos.rank.df)[6]<-"date"
+
+#associate rank to the juvenile ID
+colnames(cos.rank.df)[1]<-"ID"
+cos.sptl.status4<-merge(cos.sptl.status3,cos.rank.df, by=c("ID", "date", "troop"), all.x=TRUE)
+
+# associate rank to the mother ID
+colnames(cos.rank.df)[1]<-"mumID"
+cos.sptl.status5<-merge(cos.sptl.status4,cos.rank.df, by=c("mumID", "date", "troop"), all.x=TRUE)
+
+
+cos.sptl.f<-cos.sptl.status5[,-c(12,13,15,16)] # get rid of the unnecessary columns
+colnames(cos.sptl.f)[12]<-"rank_juve"
+colnames(cos.sptl.f)[13]<-"rank_mum"
+```
+
+### EXTRACT MEASURES FOR GROOMING DATA
+
+## Again the extraction of strong ties will take some time to run so you can just skip that chunk and load the strong ties dataframe.
+
+```{r}
+## dataframes for storage.
+strong_weak_ties_gr <-data.frame(weight=1, strong=1, dyads="id1 id2", focal= "id2", date = as.Date("2015-01-01"), troop="RST")
+
+windowsize<- days(60)
+windowshift<- days(30)
+
+for ( k in unique(groom.data$TroopID)){
+  
+  ## Select the troop we want 
+  troop.data<- groom.data %>% filter(TroopID==k)
+  
+  windowstart<-min(troop.data$Date)
+  windowend<-as.Date(windowstart) + windowsize
+  
+  while (as.Date(windowstart) + windowsize <= max(troop.data$Date)){
+    
+    df.subset <- create.window(troop.data, windowstart, windowend)
+    
+    edgelist<- create.an.edgeList(df.subset[,c(1,2)])
+    
+    # individual with interactions present in both: directed = FALSE
+    presence.both <- unique(c(as.character(edgelist$from),as.character(edgelist$to)))
+    prez<-data.frame(ID=presence.both)
+    prez.stat<-merge(prez,status.bis, by="ID", all.x=T)
+    prez.only<-prez.stat%>%filter(sex!=0 | cohort!="A")
+    
+    presence.needed<- prez.only$ID
+    
+    for (each in presence.needed){
+      
+      current.ind <- edgelist%>% filter(from %in% each | to %in% each)
+      
+      if (nrow(current.ind)>=2){
+        
+        current.ind$dyads <- ifelse(as.character(current.ind$from) < as.character(current.ind$to), paste(current.ind$from, current.ind$to), paste(current.ind$to, current.ind$from))
+        
+        non.dire.edgelist<-current.ind%>% dplyr::group_by(dyads)%>% dplyr::summarise (weight=sum(weight))
+        
+        if (nrow(non.dire.edgelist)>1 && sd(non.dire.edgelist$weight)!=0 ){
+          
+          # Extract strong ties       
+          strong.ties <- model_based_strong_ties(non.dire.edgelist$weight, sd_diff = 0, min_diff = 5)
+          
+          # Store measure
+          strong.ties$focal<- each
+          strong.ties$date<- windowstart
+          strong.ties$troop<- k
+          
+          strong.ties <-merge(strong.ties,non.dire.edgelist, by ="weight", all.x=T)
+          strong_weak_ties_gr<- rbind(strong_weak_ties_gr,strong.ties)
+          gc()
+        }
+      }
+    }
+    
+    windowend = windowend + windowshift
+    windowstart= as.Date(windowstart)+windowshift
+  }
+}
+
+strong_ties_gr<- strong_weak_ties_gr%>% filter(ties !="1")
+strong_ties_gr$focal<-as.character(strong_ties_gr$focal)
+
+```
+
+# Set up the grooming strong ties dataframe.
+
+```{r}
+strong_weak_ties_gr<- read.csv("w_strong_ties_gr.csv")
+strong_weak_ties_gr<-strong_weak_ties_gr[,-1]
+strong_weak_ties_gr$focal<-as.character(strong_weak_ties_gr$focal)
+
+strong_weak_ties_gr[c('ID1', 'ID2')] <- str_split_fixed(strong_weak_ties_gr$dyads, ' ', 2)
+
+
+for (i in 1:nrow(strong_weak_ties_gr)){
+  
+  if (strong_weak_ties_gr[i,"ID1"]==strong_weak_ties_gr[i,"focal"] ){
+    strong_weak_ties_gr[i,"tie"]<- strong_weak_ties_gr[i,"ID2"]
+  }else{
+    strong_weak_ties_gr[i,"tie"]<- strong_weak_ties_gr[i,"ID1"]
+  }
+}
+
+strong_weak_ties_gr<-strong_weak_ties_gr %>% select (-("dyads"), -("ID1"), -("ID2"))
+
+strong_weak_ties_gr<- strong_weak_ties_gr%>% filter(focal!="lisainf14" & focal!="puzzinf16" & focal!="macy" & focal!="needinf16",focal!="cyclinf15" & focal!="cyclinf16" & focal!="doriinf16" & focal!="dottinf16",focal!="ellainf16" & focal!="fayinf15" & focal!="floinf15" & focal!="ginginf16",focal!="hollinf16" & focal!="jasminf15" & focal!="jasminf16" & focal!="laurinf15",focal!="laurinf16" & focal!="layainf15" & focal!="lucyinf15",focal!="lucyinf16" & focal!="phoeinf16" & focal!="saffinf16" & focal!="shuminf15",focal!="valkinf16" & focal!="ubuninf16" & focal!="tearinf16",focal!="cura" & focal!="port" & focal!="swaz")
+
+strong_ties_gr<-strong_weak_ties_gr%>%filter(strong==1)
+```
+
+## Add status and whether the str ties are part of the focal family.
+
+```{r}
+colnames(status.df)<-c("tie", "ties_status")
+str.ties.gr.status<-merge(strong_ties_gr, status.df, by="tie", all.x=T)
+colnames(status.df)<-c("focal", "focal_status")
+str.ties.gr.status2<-merge(str.ties.gr.status, status.df, by="focal", all.x=T)
+str.ties.gr.juve<-str.ties.gr.status2 %>% filter(focal_status!="A" &focal_status!="2012" &focal!="saffinf16")
+
+# is the tie from the focal's fam? yes or no?
+
+for (i in 1:nrow(str.ties.gr.juve)){
+  
+  id<-str.ties.gr.juve[i, "focal"]
+  fam.nb<-grep(id, family.list)
+  nodes_family<- family.list[[fam.nb]] 
+  
+  if(str.ties.gr.juve[i, "tie"] %in% nodes_family){
+    str.ties.gr.juve[i, "is.tie.fam"]<-1
+  } else{
+    str.ties.gr.juve[i, "is.tie.fam"]<-0
+  }
+}
+
+```
+
+## Within strong ties, extract the proportion of group members to which juveniles are exposed
+
+```{r}
+rate.values.gr <- data.frame(focal="pouit", rate.adult=1,rate.juve=1,rate.family=1, rate.nonfamily=1, date=as.Date("2015-01-01"), troop="PT")
+temp.df<-data.frame(focal="pouit", rate.adult=1,rate.juve=1,rate.family=1, rate.nonfamily=1, date=as.Date("2015-01-01"))
+
+for (each in unique(str.ties.gr.juve$focal)){
+  
+  sub.id<- str.ties.gr.juve%>% filter(focal==each)
+  rate.adult<-NA
+  rate.juve<-NA
+  rate.family<-NA
+  rate.nonfamily<- NA
+  
+  for ( i in 1:length(unique(sub.id$date))){
+    
+    date_nb<-unique(sub.id$date)[i]
+    sub.id.date<- sub.id %>% filter(date ==date_nb)
+    
+    sub.id.fam<-sub.id.date %>% filter(is.tie.fam==1)
+    
+    if(nrow(sub.id.fam)>0 ){
+      rate.family<- sum(as.numeric(sub.id.fam$weight))/ sum(sub.id.date$weight)
+      rate.nonfamily<-1-rate.family
+    }else{
+      rate.family<-0
+      rate.nonfamily<-1
+    }
+    
+    sub.id.adult<-sub.id.date %>% filter(ties_status=="A")
+    
+    if(nrow(sub.id.adult)>0){
+      rate.adult<- sum(as.numeric(sub.id.adult$weight))/ sum(sub.id.date$weight)
+      rate.juve<-1-rate.adult 
+    }else{
+      rate.adult<-0
+      rate.juve<-1
+    }
+    
+    obs.values<-data.frame(cbind(focal=each,  rate.adult=rate.adult, rate.juve=rate.juve, rate.family=rate.family, rate.nonfamily=rate.nonfamily))
+    
+    def.value<-cbind(obs.values ,data.frame(date= date_nb))
+    temp.df<-rbind(temp.df, def.value)
+  }
+  
+  def.value2<-cbind(temp.df ,data.frame(troop= as.character(sub.id[1,"troop"])))
+  rate.values.gr<-rbind(rate.values.gr, def.value2)
+  temp.df<-data.frame(focal="pouit", rate.adult=1,rate.juve=1,rate.family=1, rate.nonfamily=1, date=as.Date("2015-01-01"))
+}
+
+rate.values.gr<-rate.values.gr%>%filter(focal !="pouit")
+
+rate.gr.df<-reshape2::melt(rate.values.gr, id = c("focal","date","troop"))
+```
+
+## Trim our measures so that all individuals within the same cohort appear in the dataset at the same time.
+
+```{r}
+# build triming function
+trim_nodes <- function (nodevalues, data) {
+  
+  names.kept <- unique (nodevalues$focal)
+  df.trim <-data.frame(matrix(NA,ncol=5, nrow=))
+  colnames(df.trim) <-c(colnames(nodevalues))
+  df.trim$date<-ymd(df.trim$date)
+  
+  for (i in 1:length(names.kept)) {
+    
+    df.temp <- data %>% filter(ID == names.kept[i])
+    
+    min.date <- df.temp[,"appear"]
+    df.temp2 <- nodevalues %>% filter (focal==names.kept[i])
+    df.temp2$windowend <- df.temp2$date + days(60)
+    
+    df.temp2[, "value"] <- ifelse(df.temp2[, "date"] < min.date,   NA, df.temp2[, "value"])
+    df.trim <- rbind(df.trim, df.temp2[,c(1:5)])
+  }
+  df.trim <- df.trim[-1,]
+  
+  return(df.trim)
+}
+
+rate.gr.t<-trim_nodes(rate.gr.df, df.appearance)
+rate.gr.t<-rate.gr.t[complete.cases(rate.gr.t),]
+
+```
+
+## Extract age
+
+```{r}
+age.node<-data.frame(ID="pouit", age=1,  date = as.Date("2015-01-01"), troop="pouit")
+colnames(rate.gr.t)[1]<-"ID"
+
+for (each in 1:nrow(rate.gr.t)){
+  
+  date.sub<-rate.gr.t[each,]
+  
+  age.df<-data.frame(ID="pouit", age=1, date = as.Date("2015-01-01"), troop="pouit")
+  age.df$ID<- date.sub[1,"ID"]
+  birth.ID<-birth.df%>% filter(ID == as.character(date.sub[1,"ID"]))
+  
+  if(is.na(birth.ID[,"birth"])==FALSE){
+    
+    age.df$age<-as.numeric(ymd(date.sub[1,"date"]) - birth.ID[1,"birth"]) +1
+    
+  } else{
+    
+    age.df$age<-NA
+  }
+  
+  age.df$date<- date.sub[1,"date"]
+  age.df$troop<- date.sub[1,"troop"]  
+  
+  age.node<- rbind(age.node, age.df)
+}
+age.node<-age.node%>% filter(ID!="pouit")
+
+rate.gr.t2<-merge(rate.gr.t,age.node, by =c("ID", "date", "troop"), all.x=T)
+rate.gr.t2<-distinct(rate.gr.t2)
+```
+
+## Extract number of scans
+
+```{r}
+# get storage ready
+scan.nb.df<- data.frame(matrix(NA,ncol=3))
+colnames(scan.nb.df)<- c("scan_nb","troop", "date")
+scan.nb.df$date<- as.Date(scan.nb.df$date)
+
+temp.df<- data.frame(matrix(NA,ncol=3))
+colnames(temp.df)<- c("scan_nb","troop", "date")
+temp.df$date<- as.Date(temp.df$date)
+
+grooming.merged<-groom.data[,c(1,2,5,3,4,6)]
+
+for (l in unique(sptl.data$TroopID)){
+  
+  # select the troop 
+  troop.data.gr <-grooming.merged%>% filter(TroopID==l)
+  windowstart<- min(troop.data.gr$Date)
+  windowend <- as.Date(windowstart)+ windowsize
+  
+  while (as.Date(windowstart) + windowsize <= max(troop.data.gr$Date)) {
+    
+    window.df <-create.window(troop.data.gr, windowstart, windowend)
+    
+    temp.df$troop<-l
+    temp.df$date<-as.Date(windowstart)
+    temp.df$scan_nb<-length(unique(window.df$Scan))
+    scan.nb.df<-rbind(scan.nb.df,temp.df)
+    
+    windowend = windowend + windowshift
+    windowstart= as.Date(windowstart)+ windowshift
+  }
+}
+
+scan.nb.df<-scan.nb.df[-1,]
+
+rate.gr.t3<- merge(rate.gr.t2, scan.nb.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute troop number
+
+```{r}
+rate.gr.t4<-merge(rate.gr.t3,troop.size, by =c("date", "troop"), all.x=T)
+```
+
+## Attribute sex and cohort of the focal 
+
+```{r}
+rate.gr.status<-merge(rate.gr.t4, status.bis, by="ID", all.x=T)
+```
+
+## Attribute the identity of the focal's mother
+
+```{r}
+rate.gr.status2 <-merge(rate.gr.status, mumid.df, by ="ID", all.x=T)
+```
+
+## Attribute ndvi
+
+```{r}
+rate.gr.status3 <-merge(rate.gr.status2, ndvi.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute rank of the focal
+
+```{r}
+#associate rank to the juvenile ID
+colnames(data.rank.df)[1]<-"ID"
+rate.gr.status4<-merge(rate.gr.status3,data.rank.df, by=c("ID", "date", "troop"), all.x=TRUE)
+
+# associate rank to the mother ID
+colnames(data.rank.df)[1]<-"mumID"
+rate.gr.status5<-merge(rate.gr.status4,data.rank.df, by=c("mumID", "date", "troop"), all.x=TRUE)
+
+
+rate.gr.f<-rate.gr.status5[,-c(13,14,16,17)] # get rid of the unnecessary columns
+colnames(rate.gr.f)[13]<-"rank_juve"
+colnames(rate.gr.f)[14]<-"rank_mum"
+
+```
+
+## Extract degree
+
+```{r}
+ind.present <- unique(c (unique(str.ties.gr.juve$focal), unique(str.ties.gr.juve$tie)))
+degree.values.gr<-data.frame(matrix(NA, ncol= length(ind.present)+2)) 
+colnames(degree.values.gr)<- ind.present #unique(str.ties.sptl.juve$tie)
+colnames(degree.values.gr)[121:122]<-c("troop","date") 
+degree.values.gr$date<-as.Date(degree.values.gr$date)
+
+
+for (l in unique(str.ties.gr.juve$troop)){
+  
+  # select the troop 
+  troop.data <-str.ties.gr.juve %>% filter(troop==l)
+  
+  for ( i in 1:length(unique(troop.data$date))){
+    
+    date_nb<-unique(troop.data$date)[i]
+    
+    sub.date<- troop.data %>% filter(date ==date_nb)
+    nodes_of_interest <- unique (c(sub.date$focal, sub.date$tie))
+    
+    net<- create.a.network(sub.date, directed=FALSE)
+    ind.degree<-data.frame(t(igraph::degree(net)))
+    ind.degree$troop<-l
+    ind.degree$date<-date_nb
+    ind.degree$date<- as.Date(ind.degree$date)
+    
+    degree.values.gr <- plyr::rbind.fill(degree.values.gr,ind.degree)
+    
+  }
+}
+
+degree.values.gr<-degree.values.gr[-1,]
+
+data.long.degree.gr <- reshape2::melt(degree.values.gr, id = c("date", "troop"))
+names(data.long.degree.gr)[names(data.long.degree.gr) == "variable"] <- "ID"
+names(data.long.degree.gr)[names(data.long.degree.gr) == "value"] <- "degree"
+data.long.degree.gr<-data.long.degree.gr[complete.cases(data.long.degree.gr),]
+
+trim_nodes <- function (nodevalues, data) {
+  
+  names.kept <- unique (nodevalues$ID)
+  df.trim <-data.frame(matrix(NA,ncol=4, nrow=))
+  colnames(df.trim) <-c(colnames(nodevalues))
+  df.trim$date<-ymd(df.trim$date)
+  
+  for (i in 1:length(names.kept)) {
+    
+    df.temp <- data %>% filter(ID == names.kept[i])
+    
+    min.date <- df.temp[,"appear"]
+    df.temp2 <- nodevalues %>% filter (ID==names.kept[i])
+    df.temp2$windowend <- df.temp2$date + days(60)
+    
+    df.temp2[, "degree"] <- ifelse(df.temp2[, "date"] < min.date,   NA, df.temp2[, "degree"])
+    df.trim <- rbind(df.trim, df.temp2[,c(1:4)])
+  }
+  df.trim <- df.trim[-1,]
+  
+  return(df.trim)
+}
+
+degree.gr.t<-trim_nodes(data.long.degree.gr, df.appearance)
+```
+
+## Extract age
+
+```{r}
+age.node<-data.frame(ID="pouit", age=1,  date = as.Date("2015-01-01"), troop="pouit")
+
+for (each in 1:nrow(degree.gr.t)){
+  
+  date.sub<-degree.gr.t[each,]
+  
+  age.df<-data.frame(ID="pouit", age=1, date = as.Date("2015-01-01"), troop="pouit")
+  age.df$ID<- date.sub[1,"ID"]
+  birth.ID<-birth.df%>% filter(ID == as.character(date.sub[1,"ID"]))
+  
+  if(is.na(birth.ID[,"birth"])==FALSE){
+    
+    age.df$age<-as.numeric(ymd(date.sub[1,"date"]) - birth.ID[1,"birth"]) +1
+    
+  } else{
+    
+    age.df$age<-NA
+  }
+  
+  age.df$date<- date.sub[1,"date"]
+  age.df$troop<- date.sub[1,"troop"]  
+  
+  age.node<- rbind(age.node, age.df)
+}
+age.node<-age.node%>% filter(ID!="pouit")
+
+degree.gr.t2<-merge(degree.gr.t,age.node, by =c("ID", "date", "troop"), all.x=T)
+```
+
+## Attribute number of scans
+
+```{r}
+degree.gr.t3<- merge(degree.gr.t2, scan.nb.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute troop number
+
+```{r}
+degree.gr.t4<-merge(degree.gr.t3,troop.size, by =c("date", "troop"), all.x=T)
+degree.gr.t4<-degree.gr.t4[complete.cases(degree.gr.t4),]
+```
+
+## Attribute sex and cohort of the focal 
+
+```{r}
+degree.gr.status<-merge(degree.gr.t4, status.bis, by="ID", all.x=T)
+```
+
+## Attribute the identity of the focal's mother
+
+```{r}
+degree.gr.status2 <-merge(degree.gr.status,mumid.df, by ="ID", all.x=T)
+```
+
+## Attribute ndvi
+
+```{r}
+degree.gr.status3 <-merge(degree.gr.status2, ndvi.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute rank of the focal
+
+```{r}
+colnames(data.rank.df)[1]<-"ID"
+
+#associate rank to the juvenile ID
+degree.gr.status4<-merge(degree.gr.status3,data.rank.df, by=c("ID", "date", "troop"), all.x=TRUE)
+
+# associate rank to the mother ID
+colnames(data.rank.df)[1]<-"mumID"
+degree.gr.status5<-merge(degree.gr.status4,data.rank.df, by=c("mumID", "date", "troop"), all.x=TRUE)
+
+
+degree.gr.f<-degree.gr.status5[,-c(13,12,16,15)] # get rid of the unnecessary columns
+colnames(degree.gr.f)[12]<-"rank_juve"
+colnames(degree.gr.f)[13]<-"rank_mum"
+
+```
+
+## Extract strength
+
+```{r}
+# set strength function
+strength <- function (net) {
+  strength <-igraph::strength(net, mode=c("all"))
+  return(strength)
+}
+
+ind.present <- unique(c (unique(str.ties.gr.juve$focal), unique(str.ties.gr.juve$tie)))
+str.values.gr<-data.frame(matrix(NA, ncol= length(ind.present)+2)) 
+colnames(str.values.gr)<- ind.present
+colnames(str.values.gr)[121:122]<-c( "troop","date") 
+str.values.gr$date<-as.Date(str.values.gr$date)
+
+for (l in unique(str.ties.gr.juve$troop)){
+  
+  # select the troop 
+  troop.data <-str.ties.gr.juve%>% filter(troop==l)
+  
+  for ( i in 1:length(unique(troop.data$date))){
+    
+    date_nb<-unique(troop.data$date)[i]
+    
+    sub.date<- troop.data %>% filter(date ==date_nb)
+    nodes_of_interest <- unique (c(sub.date$focal, sub.date$tie))
+    
+    net<- create.a.network(sub.date, directed=FALSE)
+    ind.str<-data.frame(t(strength(net))) #, mode="out"
+    ind.str$troop<-l
+    ind.str$date<-date_nb
+    ind.str$date<- as.Date(ind.str$date)
+    
+    str.values.gr<-plyr::rbind.fill(str.values.gr,ind.str)
+    
+  }
+}
+
+str.values.gr<-str.values.gr[-1,]
+
+data.long.str.gr <- reshape2::melt(str.values.gr, id = c("date", "troop"))
+names(data.long.str.gr)[names(data.long.str.gr) == "variable"] <- "ID"
+names(data.long.str.gr)[names(data.long.str.gr) == "value"] <- "strength"
+
+# Trim
+trim_nodes <- function (nodevalues, data) {
+  
+  names.kept <- unique (nodevalues$ID)
+  df.trim <-data.frame(matrix(NA,ncol=4, nrow=))
+  colnames(df.trim) <-c(colnames(nodevalues))
+  df.trim$date<-ymd(df.trim$date)
+  
+  for (i in 1:length(names.kept)) {
+    
+    df.temp <- data %>% filter(ID == names.kept[i])
+    
+    min.date <- df.temp[,"appear"]
+    df.temp2 <- nodevalues %>% filter (ID==names.kept[i])
+    df.temp2$windowend <- df.temp2$date + days(60)
+    
+    df.temp2[, "strength"] <- ifelse(df.temp2[, "date"] < min.date,   NA, df.temp2[, "strength"])
+    df.trim <- rbind(df.trim, df.temp2[,c(1:4)])
+  }
+  df.trim <- df.trim[-1,]
+  
+  return(df.trim)
+}
+
+str.gr.t<-trim_nodes(data.long.str.gr, df.appearance)
+str.gr.t<-str.gr.t[complete.cases(str.gr.t),]
+```
+
+## Extract age
+
+```{r}
+age.node<-data.frame(ID="pouit", age=1,  date = as.Date("2015-01-01"), troop="pouit")
+
+for (each in 1:nrow(str.gr.t)){
+  
+  date.sub<-str.gr.t[each,]
+  
+  age.df<-data.frame(ID="pouit", age=1, date = as.Date("2015-01-01"), troop="pouit")
+  age.df$ID<- date.sub[1,"ID"]
+  birth.ID<-birth.df%>% filter(ID == as.character(date.sub[1,"ID"]))
+  
+  if(is.na(birth.ID[,"birth"])==FALSE){
+    
+    age.df$age<-as.numeric(ymd(date.sub[1,"date"]) - birth.ID[1,"birth"]) +1
+    
+  } else{
+    
+    age.df$age<-NA
+  }
+  
+  age.df$date<- date.sub[1,"date"]
+  age.df$troop<- date.sub[1,"troop"]  
+  
+  age.node<- rbind(age.node, age.df)
+}
+age.node<-age.node%>% filter(ID!="pouit")
+
+str.gr.t2<-merge(str.gr.t,age.node, by =c("ID", "date", "troop"), all.x=T)
+
+```
+
+## Attribute number of scans
+
+```{r}
+str.gr.t3<- merge(str.gr.t2, scan.nb.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute troop number
+
+```{r}
+str.gr.t4<-merge(str.gr.t3,troop.size, by =c("date", "troop"), all.x=T)
+```
+
+## Attribute sex and cohort of the focal 
+
+```{r}
+str.gr.status<-merge(str.gr.t4, status.bis, by="ID", all.x=T)
+```
+
+## Attribute the identity of the focal's mother
+
+```{r}
+str.gr.status2 <-merge(str.gr.status,mumid.df, by ="ID", all.x=T)
+```
+
+## Attribute ndvi
+
+```{r}
+str.gr.status3 <-merge(str.gr.status2, ndvi.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute rank of the focal
+
+```{r}
+colnames(data.rank.df)[1]<-"ID"
+
+#associate rank to the juvenile ID
+str.gr.status4<-merge(str.gr.status3,data.rank.df, by=c("ID", "date", "troop"), all.x=TRUE)
+
+# associate rank to the mother ID
+colnames(data.rank.df)[1]<-"mumID"
+str.gr.status5<-merge(str.gr.status4,data.rank.df, by=c("mumID", "date", "troop"), all.x=TRUE)
+
+
+str.gr.f<-str.gr.status5[,-c(13,12,16,15)] # get rid of the unnecessary columns
+colnames(str.gr.f)[12]<-"rank_juve"
+colnames(str.gr.f)[13]<-"rank_mum"
+
+```
+
+## Extract cosine similarity
+
+```{r}
+## dataframes for storage.
+cosine.gr.str<-  data.frame(ID=as.character("pouit"), cosine=1, date = as.Date("2015-01-01"), troop="RST")
+
+for ( k in unique(str.ties.gr.juve$troop)){
+  
+  ## Select the troop we want 
+  troop.data<- str.ties.gr.juve %>% filter(troop==k)
+  
+  edgelist.previous<-data.frame()
+  
+  for ( i in 1:length(unique(troop.data$date))){
+    
+    date_nb<-unique(troop.data$date)[i]
+    sub.date<- troop.data %>% filter(date ==date_nb)
+    
+    if(nrow(sub.date)>0 & nrow(edgelist.previous)>0){
+      
+      list.prev<- unique(c(as.character(edgelist.previous$focal),as.character(edgelist.previous$tie)))
+      list.current<- unique(c(as.character(sub.date$focal),as.character(sub.date$tie)))
+      
+      presence.indi <-unique(list.prev[list.prev %in% list.current])
+      presence.indi2<-unique(list.current[list.current %in% list.prev])
+      presence.both<- unique(c(presence.indi,presence.indi2))
+      
+      if (length(presence.both)>0){
+        
+        for (each in presence.both){
+          
+          cos.node.gr<-data.frame(ID="pouit", cosine=1,date = as.Date ("2015-01-01"), troop="RST")
+          
+          current.ind <- sub.date%>% filter(focal %in% each | tie %in% each)
+          previous.ind <- edgelist.previous%>% filter(focal %in% each | tie %in% each)
+          
+          current.ind$dyads <- ifelse(as.character(current.ind$focal) < as.character(current.ind$tie), paste(current.ind$focal, current.ind$tie), paste(current.ind$tie, current.ind$focal))
+          current.edgelist<-current.ind%>% dplyr::group_by(dyads)%>% dplyr::summarise(weight.bis=sum(weight))
+          
+          previous.ind$dyads <- ifelse(as.character(previous.ind$focal) < as.character(previous.ind$tie), paste(previous.ind$focal, previous.ind$tie), paste(previous.ind$tie, previous.ind$focal))
+          
+          prev.edgelist<-previous.ind%>% dplyr::group_by(dyads)%>% dplyr::summarise(weight.bis=sum(weight))
+          edgelists<-merge(current.edgelist,prev.edgelist, by=c("dyads"), all=TRUE)
+          edgelists[is.na(edgelists)] <- 0
+          cosine.node<-lsa::cosine((edgelists$weight.bis.x), (edgelists$weight.bis.y))
+          
+          # Store measure
+          cos.node.gr$ID<- each
+          cos.node.gr$cosine<-cosine.node
+          cos.node.gr$date<- date_nb
+          cos.node.gr$troop<- k
+          cosine.gr.str<- rbind(cosine.gr.str,cos.node.gr)
+        }
+      }
+    }
+    edgelist.previous<- sub.date
+  }
+}
+
+cosine.gr.str<- cosine.gr.str%>% filter(ID !="pouit")
+
+
+### Trim our values
+trim_nodes <- function (nodevalues, data) {
+  
+  names.kept <- unique (nodevalues$ID)
+  df.trim <-data.frame(matrix(NA,ncol=4, nrow=))
+  colnames(df.trim) <-c(colnames(nodevalues))
+  df.trim$date<-ymd(df.trim$date)
+  
+  for (i in 1:length(names.kept)) {
+    
+    df.temp <- data %>% filter(ID == names.kept[i])
+    
+    min.date <- df.temp[,"appear"]
+    df.temp2 <- nodevalues %>% filter (ID==names.kept[i])
+    df.temp2$windowend <- df.temp2$date + days(60)
+    
+    df.temp2[, "cosine"] <- ifelse(df.temp2[, "date"] < min.date,NA, df.temp2[, "cosine"])
+    df.trim <- rbind(df.trim, df.temp2[,c(1:4)])
+  }
+  df.trim <- df.trim[-1,]
+  
+  return(df.trim)
+}
+
+cosine.gr.str.t<-trim_nodes(cosine.gr.str, df.appearance)
+```
+
+## Extract age
+
+```{r}
+age.node<-data.frame(ID="pouit", age=1,  date = as.Date("2015-01-01"), troop="pouit")
+
+for (each in 1:nrow(cosine.gr.str.t)){
+  
+  date.sub<-cosine.gr.str.t[each,]
+  
+  age.df<-data.frame(ID="pouit", age=1, date = as.Date("2015-01-01"), troop="pouit")
+  age.df$ID<- date.sub[1,"ID"]
+  birth.ID<-birth.df%>% filter(ID == as.character(date.sub[1,"ID"]))
+  
+  if(is.na(birth.ID[,"birth"])==FALSE){
+    
+    age.df$age<-as.numeric(ymd(date.sub[1,"date"]) - birth.ID[1,"birth"]) +1
+    
+  } else{
+    
+    age.df$age<-NA
+  }
+  
+  age.df$date<- date.sub[1,"date"]
+  age.df$troop<- date.sub[1,"troop"]  
+  
+  age.node<- rbind(age.node, age.df)
+}
+age.node<-age.node%>% filter(ID!="pouit")
+
+cosine.gr.str.t2<-merge(cosine.gr.str.t,age.node, by =c("ID", "date", "troop"), all.x=T)
+```
+
+## Attribute number of scans
+
+```{r}
+cosine.gr.str.t3<- merge(cosine.gr.str.t2, scan.nb.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute troop number
+
+```{r}
+cosine.gr.str.t4<-merge(cosine.gr.str.t3,troop.size, by =c("date", "troop"), all.x=T)
+```
+
+## Attribute sex and cohort of the focal 
+
+```{r}
+cos.gr.status<-merge(cosine.gr.str.t4, status.bis, by="ID", all.x=T)
+```
+
+## Attribute the identity of the focal's mother
+
+```{r}
+cos.gr.status2 <-merge(cos.gr.status,mumid.df, by ="ID", all.x=T)
+```
+
+## Attribute ndvi
+
+```{r}
+cos.gr.status3 <-merge(cos.gr.status2, ndvi.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute rank of the focal
+
+```{r}
+#associate rank to the juvenile ID
+colnames(cos.rank.df)[1]<-"ID"
+cos.gr.status4<-merge(cos.gr.status3,cos.rank.df, by=c("ID", "date", "troop"), all.x=TRUE)
+
+# associate rank to the mother ID
+colnames(cos.rank.df)[1]<-"mumID"
+cos.gr.status5<-merge(cos.gr.status4,cos.rank.df, by=c("mumID", "date", "troop"), all.x=TRUE)
+
+
+cos.gr.f<-cos.gr.status5[,-c(12,13,15,16)] # get rid of the unnecessary columns
+colnames(cos.gr.f)[12]<-"rank_juve"
+colnames(cos.gr.f)[13]<-"rank_mum"
+```
+
+### COSINE SIMILARITY BETWEEN SPATIAL AND GROOMING BEHAVIOURS
+
+```{r}
+cosine.btw.ties<- data.frame(ID="pouit", cosine=1, date = as.Date("2015-01-01"), troop="RST")
+str.ties.gr.juve$date<-as.Date(str.ties.gr.juve$date)
+
+for (k in unique(sptl.data$TroopID)){
+  
+  troop.data<- str.ties.sptl.juve %>% filter(troop==k)
+  groom.data<- str.ties.gr.juve%>% filter(troop==k)
+  
+  date.sp<-sort(unique(troop.data$date))
+  date.gr<-sort(unique(troop.data$date))
+  
+  for ( i in 1:length(date.sp)){
+    
+    date_nb<-date.sp[i]
+    edgelist.sp<- troop.data %>% filter(date ==date_nb)
+    
+    date_nb_gr<-date.gr[i]
+    edgelist.gr<- groom.data %>% filter(date == date_nb_gr)
+    
+    # individual with interactions present in both.
+    list.gr<- unique(c(as.character(edgelist.gr$focal), as.character(edgelist.gr$tie)))
+    list.sp<- unique(c(as.character(edgelist.sp$focal), as.character(edgelist.sp$tie)))
+    presence.indi <-unique(list.gr[list.gr %in% list.sp])
+    presence.indi2<-unique(list.sp[list.sp %in% list.gr])
+    presence.both<- unique(c(presence.indi,presence.indi2))
+    
+    if (length(presence.both)>0){
+      
+      for (each in presence.both){
+        
+        cos.node.btw<- data.frame(ID="pouit", cosine=1, date = as.Date("2015-01-01"), troop="RST")
+        
+        gr.ind <- edgelist.gr%>% filter(focal%in% each| tie %in% each)
+        sptl.ind <- edgelist.sp%>% filter(focal%in% each| tie %in% each)
+        
+        gr.ind$dyads <- ifelse(as.character(gr.ind$focal) < as.character(gr.ind$tie), paste(gr.ind$focal, gr.ind$tie), paste(gr.ind$tie, gr.ind$focal))
+        gr.edgelist<-gr.ind%>% dplyr::group_by(dyads)%>% dplyr::summarise(weight.bis=sum(weight))
+        
+        sptl.ind$dyads <- ifelse(as.character(sptl.ind$focal) < as.character(sptl.ind$tie), paste(sptl.ind$focal, sptl.ind$tie), paste(sptl.ind$tie, sptl.ind$focal))
+        sptl.edgelist<-sptl.ind%>% dplyr::group_by(dyads)%>% dplyr::summarise(weight.bis=sum(weight))
+        edgelists<-merge(gr.edgelist,sptl.edgelist, by=c("dyads"), all=TRUE)
+        edgelists[is.na(edgelists)] <- 0
+        cosine.node<-lsa::cosine((edgelists$weight.bis.x), (edgelists$weight.bis.y))
+        
+        cos.node.btw$ID<- each
+        cos.node.btw$cosine<-cosine.node
+        cos.node.btw$date<- date_nb
+        cos.node.btw$troop<-k
+        cosine.btw.ties<- rbind(cosine.btw.ties,cos.node.btw)
+      }
+    }
+  }
+}
+
+btw.cosine.ties<- cosine.btw.ties%>% filter(ID !="pouit")
+
+### Trim our values
+trim_nodes <- function (nodevalues, data) {
+  
+  names.kept <- unique (nodevalues$ID)
+  df.trim <-data.frame(matrix(NA,ncol=4, nrow=))
+  colnames(df.trim) <-c(colnames(nodevalues))
+  df.trim$date<-ymd(df.trim$date)
+  
+  for (i in 1:length(names.kept)) {
+    
+    df.temp <- data %>% filter(ID == names.kept[i])
+    
+    min.date <- df.temp[,"appear"]
+    df.temp2 <- nodevalues %>% filter (ID==names.kept[i])
+    df.temp2$windowend <- df.temp2$date + days(60)
+    
+    df.temp2[, "cosine"] <- ifelse(df.temp2[, "date"] < min.date,NA, df.temp2[, "cosine"])
+    df.trim <- rbind(df.trim, df.temp2[,c(1:4)])
+  }
+  df.trim <- df.trim[-1,]
+  
+  return(df.trim)
+}
+
+btw.cosine.ties.t<-trim_nodes(btw.cosine.ties, df.appearance)
+
+```
+
+## Extract rank
+
+```{r}
+colnames(data.rank.df)[1]<-"ID"
+btw.cosine.ties.t2<-merge(btw.cosine.ties.t,data.rank.df, by=c("ID", "date", "troop"), all.x=TRUE)
+btw.cosine.ties.t2<-btw.cosine.ties.t2[,-c(5,6)]
+
+```
+
+## Extract age
+
+```{r}
+age.node<-data.frame(ID="pouit", age=1,  date = as.Date("2015-01-01"), troop="pouit")
+
+for (each in 1:nrow(btw.cosine.ties.t2)){
+  
+  date.sub<-btw.cosine.ties.t2[each,]
+  
+  age.df<-data.frame(ID="pouit", age=1, date = as.Date("2015-01-01"), troop="pouit")
+  age.df$ID<- date.sub[1,"ID"]
+  birth.ID<-birth.df%>% filter(ID == as.character(date.sub[1,"ID"]))
+  
+  if(is.na(birth.ID[,"birth"])==FALSE){
+    
+    age.df$age<-as.numeric(ymd(date.sub[1,"date"]) - birth.ID[1,"birth"]) +1
+    
+  } else{
+    
+    age.df$age<-NA
+  }
+  
+  age.df$date<- date.sub[1,"date"]
+  age.df$troop<- date.sub[1,"troop"]  
+  
+  age.node<- rbind(age.node, age.df)
+}
+age.node<-age.node%>% filter(ID!="pouit")
+
+btw.cosine.ties.t3<-merge(btw.cosine.ties.t2,age.node, by =c("ID", "date", "troop"), all.x=T)
+```
+
+## Attribute number of scans
+
+```{r}
+# df for wihtin behav
+value.btw<- data.frame(matrix(NA,ncol=3))
+colnames(value.btw)<- c("scan_nb","troop", "date")
+value.btw$date<- as.Date(value.btw$date)
+
+temp.df<- data.frame(matrix(NA,ncol=3))
+colnames(temp.df)<- c("scan_nb","troop", "date")
+temp.df$date<- as.Date(temp.df$date)
+
+for (l in unique(sptl.data$TroopID)){
+  
+  # select the troop 
+  troop.data <-sptl.data%>% filter(TroopID==l)
+  troop.data.gr <-grooming.merged%>% filter(TroopID==l)
+  windowstart<- min(troop.data$Date)
+  windowend <- windowstart+ windowsize
+  
+  while (windowstart + windowsize <= max(troop.data$Date)) {
+    
+    window.df <-create.window(troop.data, windowstart, windowend)
+    window.df.gr <-create.window(troop.data.gr, windowstart, windowend)
+    
+    temp.df$troop<-l
+    temp.df$date<-as.Date(windowstart)
+    scan.mean<- c(length(unique(window.df$Scan)), length(unique(window.df.gr$Scan)))
+    temp.df$scan_nb<-mean(scan.mean)
+    value.btw<-rbind(value.btw,temp.df)
+    
+    windowend = windowend + windowshift
+    windowstart= windowstart+ windowshift
+  }
+}
+value.btw<-value.btw[-1,]
+
+btw.cosine.ties.t4<- merge(btw.cosine.ties.t3, value.btw, by=c("troop", "date"), all.x = TRUE)
+```
+
+## Attribute troop number
+
+```{r}
+btw.cosine.ties.t5<-merge(btw.cosine.ties.t4,troop.size, by =c("date", "troop"), all.x=T)
+```
+
+## Attribute sex and cohort of the focal 
+
+```{r}
+cos.btw.status<-merge(btw.cosine.ties.t5, status.bis, by="ID", all.x=T)
+```
+
+## Attribute the identity of the focal's mother
+
+```{r}
+cos.btw.status2 <-merge(cos.btw.status,mumid.df, by ="ID", all.x=T)
+```
+
+## Attribute ndvi
+
+```{r}
+cos.btw.f <-merge(cos.btw.status2, ndvi.df, by=c("troop", "date"), all.x = TRUE)
+```
+
+### COSINE SIMILARITY BETWEEN THE MOTHER'S AND OFFSPRING'S GROOMING PARTNERS
+
+## set up the list of mothers and siblings
+
+```{r}
+## MOTHER LIST
+mother.list <- list()
+
+nodes_of_interest_1 <- c("ella") 
+nodes_of_interest_2 <- c( "dott")
+nodes_of_interest_3 <- c("pris") 
+nodes_of_interest_4 <- c("glit") 
+nodes_of_interest_5 <- c("kins") 
+nodes_of_interest_6 <- c("pene") 
+nodes_of_interest_7 <- c("tear") 
+nodes_of_interest_8 <- c("laur")
+nodes_of_interest_9 <- c("arwe")
+nodes_of_interest_10 <- c("laya") 
+nodes_of_interest_11 <- c("tyva") 
+nodes_of_interest_12 <- c("trac") 
+nodes_of_interest_13 <- c("daff") 
+nodes_of_interest_14 <- c("brie") 
+nodes_of_interest_15 <- c("glad") 
+nodes_of_interest_16 <- c("herm") 
+nodes_of_interest_17 <- c("lisa") 
+nodes_of_interest_18 <- c("puzz") 
+nodes_of_interest_19 <- c("need") 
+nodes_of_interest_20 <- c("turt") 
+nodes_of_interest_21 <- c("naom") 
+nodes_of_interest_22 <- c("ruby") 
+nodes_of_interest_23 <- c("phoe") 
+nodes_of_interest_24 <- c("holl")
+nodes_of_interest_25 <- c("shum")
+nodes_of_interest_26 <- c("valk")
+nodes_of_interest_27 <- c("cycl")
+nodes_of_interest_28 <- c("kels")
+nodes_of_interest_29 <- c("ubun")
+nodes_of_interest_30 <- c("scar") 
+nodes_of_interest_31 <- c("ging")
+nodes_of_interest_32 <- c("flo")
+nodes_of_interest_33 <- c("ocea")
+nodes_of_interest_34 <- c("carm")
+nodes_of_interest_35 <- c("sash")
+nodes_of_interest_36 <- c("fay")
+nodes_of_interest_37 <- c("coco")
+nodes_of_interest_38 <- c("lucy")
+nodes_of_interest_39 <- c("dori")
+nodes_of_interest_40 <- c("wokb")
+nodes_of_interest_41 <- c("jasm")
+
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_1
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_2
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_3
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_4
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_5
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_6
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_7
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_8
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_9
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_10
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_11
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_12
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_13
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_14
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_15
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_16
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_17
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_18
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_19
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_20
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_21
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_22
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_23
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_24
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_25
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_26
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_27
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_28
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_29
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_30
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_31
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_32
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_33
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_34
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_35
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_36
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_37
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_38
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_39
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_40
+mother.list[[length(mother.list)+1]] <-nodes_of_interest_41
+
+
+## sibling list
+
+sibling.list <- list()
+
+nodes_of_interest_1 <- c("elto","emil","eve", "ellainf16") 
+nodes_of_interest_2 <- c("dottinf16","dice","dart","deso") 
+nodes_of_interest_3 <- c("peet","podg","port")
+nodes_of_interest_4 <- c("glue","grub") 
+nodes_of_interest_5 <- c("katn","kumq")
+nodes_of_interest_6 <- c("prof","pupi") 
+nodes_of_interest_7 <- c("timm","trip","torn", "tearinf16") 
+nodes_of_interest_8 <- c("ligh","loki", "laurinf15", "laurinf16")
+nodes_of_interest_9 <- c("amy","arag")
+nodes_of_interest_10 <- c("leon", "layainf15") 
+nodes_of_interest_11 <- c("thor","tita") 
+nodes_of_interest_12 <- c("tarz") 
+nodes_of_interest_13 <- c("disn", "damo") 
+nodes_of_interest_14 <- c("band", "bilb") 
+nodes_of_interest_15 <- c("gord", "glac") 
+nodes_of_interest_16 <- c("harr", "howz") 
+nodes_of_interest_17 <- c("lia", "lisainf14", "luxe") 
+nodes_of_interest_18 <- c("pumb", "polk", "piec", "puzzinf16") 
+nodes_of_interest_19 <- c("nife", "needinf16") 
+nodes_of_interest_20 <- c("tucs") 
+nodes_of_interest_21 <- c("nobo") 
+nodes_of_interest_22 <- c("rock") 
+nodes_of_interest_23 <- c("puck", "pean", "pino", "phoeinf16") 
+nodes_of_interest_24 <- c("hect", "hodo", "home", "hollinf16")
+nodes_of_interest_25 <- c("shel", "stru", "shuminf15")
+nodes_of_interest_26 <- c("vect", "valkinf16")
+nodes_of_interest_27 <- c("cube", "cyclinf15", "cyclinf16")
+nodes_of_interest_28 <- c("kiss")
+nodes_of_interest_29 <- c("unfu","ubuninf16")
+nodes_of_interest_30 <- c("saff", "swee") 
+nodes_of_interest_31 <- c("gizm", "gats", "guge", "ginginf16")
+nodes_of_interest_32 <- c("fina", "floinf15")
+nodes_of_interest_33 <- c("oreo", "omni", "octo")
+nodes_of_interest_34 <- c("cind", "cact")
+nodes_of_interest_35 <- c("spoc", "socr", "sarg", "swaz")
+nodes_of_interest_36 <- c("fent", "funk","fayinf15")
+nodes_of_interest_37 <- c("cola", "caba", "cura")
+nodes_of_interest_38 <- c("lore", "lucyinf15", "lucyinf16")
+nodes_of_interest_39 <- c("daen", "dire", "doriinf16")
+nodes_of_interest_40 <- c("wolo", "wood")
+nodes_of_interest_41 <- c("jasminf15","jasminf16")
+
+
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_1
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_2
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_3
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_4
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_5
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_6
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_7
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_8
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_9
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_10
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_11
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_12
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_13
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_14
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_15
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_16
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_17
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_18
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_19
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_20
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_21
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_22
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_23
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_24
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_25
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_26
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_27
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_28
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_29
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_30
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_31
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_32
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_33
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_34
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_35
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_36
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_37
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_38
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_39
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_40
+sibling.list[[length(sibling.list)+1]] <-nodes_of_interest_41
+
+```
+
+## Extract cosine similarity
+
+```{r}
+cosine.gr.mumoff <-data.frame(mum="pouit", off="pouit", cosine=1,  date = as.Date("2015-01-01"), troop="RST")
+
+for (k in unique(groom.data$TroopID)){
+  
+  ## Select the troop we want 
+  all.tie.troop.gr<-strong_weak_ties_gr %>% filter(troop==k)
+  
+  for ( u in 1:length(unique(all.tie.troop.gr$date))){
+    
+    date_nb<-unique(all.tie.troop.gr$date)[u]
+    sub.gr.date<- all.tie.troop.gr %>% filter(date ==date_nb)
+    
+    # who is present ?
+    list.current<- unique(c(as.character(sub.gr.date$focal), as.character(sub.gr.date$tie)))
+    
+    # amongst the ones present, select individuals that are a mother
+    mum.vector<-unlist(mother.list)
+    mum.present <-list.current[(list.current %in% mum.vector)]
+    
+    # amongst the ones present, select individuals that are a sibling
+    sibling.vector<-unlist(sibling.list)
+    juve.present <-list.current[(list.current %in% sibling.vector)]
+    
+    # for each of these mother, select their offsprings and see if they are present as well. 
+    for (each in 1:length(mum.present)){
+      
+      stat<- lapply(family.list, function(x) all(mum.present[each] %in% x))
+      fam.nb<-which(unlist(stat))
+      
+      fam.name<-unlist(family.list[fam.nb])
+      
+      juves.w.mum <- juve.present[(juve.present %in% fam.name)]
+      n<-length(juves.w.mum)
+      
+      if(n>0){
+        
+        for( i in 1:n){
+          
+          cos.node.tot<- data.frame(mum="pouit", off="pouit", cosine=1,  date = as.Date("2015-01-01"), troop="RST")
+          
+          juve.ego <- sub.gr.date %>% filter(focal%in% juves.w.mum[i]| tie %in% juves.w.mum[i])
+          juve.ego.w<- juve.ego%>% filter(strong==0)
+          juve.ego.w<- juve.ego.w%>% filter(focal!= mum.present[each]& tie!= mum.present[each])
+          juve.ego.w<-distinct(juve.ego.w)
+          
+          mum.ego <- sub.gr.date%>% filter(focal%in% mum.present[each]| tie %in% mum.present[each])
+          mum.ego<- mum.ego%>% filter(focal!= juves.w.mum[i]& tie!= juves.w.mum[i])
+          mum.ego<-distinct(mum.ego)
+          
+          if(nrow(juve.ego.w)>0 & nrow(mum.ego)>0){
+            juve.net <- create.a.network(juve.ego.w, directed=FALSE)
+            mums.net <- create.a.network(mum.ego,directed=FALSE)
+            cosine.node <-cosine_between_graphs(juve.net,mums.net, directed=FALSE, center = FALSE)
+            
+            cos.node.tot$mum<- mum.present[each]
+            cos.node.tot$off<- juves.w.mum[i]
+            cos.node.tot$cosine<-cosine.node
+            cos.node.tot$date<- date_nb
+            cos.node.tot$troop<-k
+            
+            cosine.gr.mumoff<- rbind(cosine.gr.mumoff,cos.node.tot)
+          }
+        }
+      }
+    }
+  }
+}
+
+cosine.gr.mumoff <- cosine.gr.mumoff %>% filter(mum !="pouit")
+
+# Merge with status 
+colnames(status.bis)[1]<-"off"
+cos.w.gr.status<- merge(cosine.gr.mumoff, status.bis, by="off", all.x = TRUE)
+```
+
+## Trim our values
+
+```{r}
+trim_nodes <- function (nodevalues, data) {
+  
+  names.kept <- unique (nodevalues$off)
+  df.trim <-data.frame(matrix(NA,ncol=7, nrow=))
+  colnames(df.trim) <-c(colnames(nodevalues))
+  df.trim$date<-ymd(df.trim$date)
+  
+  for (i in 1:length(names.kept)) {
+    
+    df.temp <- data %>% filter(ID == names.kept[i])
+    
+    min.date <- df.temp[,"appear"]
+    df.temp2 <- nodevalues %>% filter (off==names.kept[i])
+    df.temp2$windowend <- df.temp2$date + days(60)
+    
+    df.temp2[, "cosine"] <- ifelse(df.temp2[, "date"] < min.date,   NA, df.temp2[, "cosine"])
+    df.trim <- rbind(df.trim, df.temp2[,c(1:7)])
+  }
+  df.trim <- df.trim[-1,]
+  
+  return(df.trim)
+}
+
+cos.gr.mum.off.t<-trim_nodes(cos.w.gr.status, df.appearance)
+cos.gr.mum.off.t<-cos.gr.mum.off.t[complete.cases(cos.gr.mum.off.t),]
+
+colnames(cos.gr.mum.off.t)[1]<-"ID"
+```
+
+## Extract rank
+
+```{r}
+data.rank.mumoff<- data.frame()
+
+windowsize<-days(60)
+windowshift<- days(30)
+
+for (i in unique (Dominance$Troop)){
+  
+  df.troop<- Dominance %>%filter(Troop==i)
+  
+  ## Select the troop we want 
+  troop.data<- cos.gr.mum.off.t %>% filter(troop==i)
+  
+  windowstart<- min(troop.data$date) - days(120)
+  windowend<-windowstart + windowsize
+  
+  while (windowstart + windowsize <= max(troop.data$date)){
+    
+    df.subset <- create.window(df.troop[,c(3,4,1,2,5:8)], windowstart, windowend) 
+    
+    winner.loser.data<- df.subset[,c("winner","loser")]
+    winner.loser.data$winner<-as.character(winner.loser.data$winner)
+    winner.loser.data$loser<-as.character(winner.loser.data$loser)
+    
+    data.matrix <- as.conflictmat(winner.loser.data, weighted=FALSE)
+    
+    # indirect pathways of a particular length (defined by maxLength): length 2
+    DominanceProbabilityLength2 <- conductance(data.matrix, maxLength = 2)
+    
+    # find simRankOrder: length 2
+    s.rank.length2 <- simRankOrder(DominanceProbabilityLength2$p.hat, num = 10, kmax = 100)
+    
+    ranks.certainty <- individualDomProb(DominanceProbabilityLength2$p.hat)
+    
+    data.all<-merge(ranks.certainty,s.rank.length2$BestSimulatedRankOrder, by="ID", all=T)
+    data.all$troop<-i
+    data.all$Date<-windowstart
+    
+    data.rank.mumoff<-rbind.fill(data.rank.mumoff,data.all)
+    windowend = windowend + windowshift
+    windowstart= windowstart+windowshift
+  }
+}
+
+colnames(data.rank.mumoff)[6]<-"date"
+cos.gr.mumoff<-merge(cos.gr.mum.off.t,data.rank.mumoff, by=c("ID", "date", "troop"), all.x=TRUE)
+
+cos.gr.mumoff<-cos.gr.mumoff %>% select (-("Mean"), -("SD"))
+```
+
+## Attribute NDVI
+
+```{r}
+cos.gr.mumoff2 <-merge(cos.gr.mumoff,ndvi.df,by=c("date", "troop"), all.x = TRUE )
+```
+
+## Attribute troop number
+
+```{r}
+cos.gr.mumoff3 <-merge(cos.gr.mumoff2,troop.size, by=c("date", "troop"), all.x=TRUE)
+```
+
+## Extract age
+
+```{r}
+age.node<-data.frame(ID="pouit", age=1, date = as.Date("2015-01-01"), troop="pouit")
+
+for (each in 1:nrow(cos.gr.mumoff3)){
+  
+  date.sub<-cos.gr.mumoff3[each,]
+  
+  age.df<-data.frame(ID="pouit", age=1, date = as.Date("2015-01-01"), troop="pouit")
+  age.df$ID<- date.sub[1,"ID"]
+  birth.ID<-birth.df%>% filter(ID == as.character(date.sub[1,"ID"]))
+  
+  if(is.na(birth.ID[,"birth"])==FALSE){
+    
+    age.df$age<-as.numeric(ymd(date.sub[1,"date"]) - birth.ID[1,"birth"]) +1
+    
+  } else{
+    
+    age.df$age<-NA
+  }
+  
+  age.df$date<- date.sub[1,"date"]
+  age.df$troop<- date.sub[1,"troop"]  
+  
+  age.node<- rbind(age.node, age.df)
+}
+
+age.node<-age.node%>% filter(ID!="pouit")
+age.node<-distinct(age.node)
+
+cos.gr.mumoff4 <-merge(cos.gr.mumoff3, age.node, by=c("ID", "date", "troop"), all.x=TRUE)
+```
+
+## Attribute scan number
+
+```{r}
+cos.gr.mum.off.f <-merge(cos.gr.mumoff4,scan.nb.df, by=c("date", "troop"), all.x=TRUE)
+```
+
+## Keep only the finale datasets
+
+```{r}
+rm(list=setdiff(ls(), c("groom.data", "sptl.data", "rate.sptl.f", "rate.gr.f", "str.ties.gr.juve","str.ties.sptl.juve","cos.sptl.f","cos.gr.f","cos.btw.f","degree.gr.f","degree.sptl.f", "str.sptl.f","str.gr.f", "cos.gr.mum.off.f")))
+```
+
+### MODELLING PART
+
+## Spatial
+
+  # Degree
+
+```{r}
+degree.sptl.s<-degree.sptl.f[complete.cases(degree.sptl.f),]
+# Scale our variables 
+degree.sptl.s$age.s<-scale(degree.sptl.s$age)
+degree.sptl.s$NDVI.s<-scale(degree.sptl.s$NDVI)
+degree.sptl.s$troop.nb.s<-scale(degree.sptl.s$troop.nb)
+degree.sptl.s$rank.s<-scale(degree.sptl.s$rank_juve)
+
+degree.sptl.s2<-degree.sptl.s%>%select(NDVI.s, scan_nb, age.s, troop.nb.s, degree, rank.s, ID, cohort, troop, mumID,sex)
+
+# Model 
+prop_mod <- bf(degree ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + offset(log(scan_nb)) + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+# Poisson family
+mod.sptl.degree <- brm(prop_mod, data=degree.sptl.s2, family = poisson(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.sptl.degree)
+summary(mod.sptl.degree)
+
+# check for potential dispersion issue
+PosteriorPredictions <-predict(mod.sptl.degree, summary=FALSE)
+PosteriorPredictions <- t(PosteriorPredictions)
+medianPosteriorPredictions<- apply(PosteriorPredictions,1,median)
+observations <- degree.sptl.s2$degree 
+Dharma <- createDHARMa(fittedPredictedResponse = medianPosteriorPredictions, simulatedResponse = PosteriorPredictions, observedResponse = observations, integerResponse = T)
+testDispersion<-testDispersion(Dharma, plot=T)
+
+# Negative binomial family
+degree.sptl.s2$new_degree<-degree.sptl.s2$degree -1
+
+prop_mod <- bf(new_degree ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + offset(log(scan_nb)) + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.sptl.degree2 <- brm(prop_mod, data=degree.sptl.s2, family = negbinomial(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.sptl.degree2)
+summary(mod.sptl.degree2)
+
+# check for potential dispersion issue
+PosteriorPredictions <-predict(mod.sptl.degree2, summary=FALSE)
+PosteriorPredictions <- t(PosteriorPredictions)
+medianPosteriorPredictions<- apply(PosteriorPredictions,1,median)
+observations <- degree.sptl.s2$new_degree
+Dharma <- createDHARMa(fittedPredictedResponse = medianPosteriorPredictions, simulatedResponse = PosteriorPredictions, observedResponse = observations, integerResponse = T)
+testDispersion<-testDispersion(Dharma, plot=T)
+
+loo_compare(loo(mod.sptl.degree2),loo(mod.sptl.degree))
+```
+
+  # Strength
+
+```{r}
+str.sptl.s<-str.sptl.f[complete.cases(str.sptl.f),]
+# Scale our variables
+str.sptl.s$age.s<-scale(str.sptl.s$age)
+str.sptl.s$NDVI.s<-scale(str.sptl.s$NDVI)
+str.sptl.s$troop.nb.s<-scale(str.sptl.s$troop.nb)
+str.sptl.s$rank.s<-scale(str.sptl.s$rank_juve)
+
+str.sptl.s2<-str.sptl.s%>%select(NDVI.s, scan_nb, age.s, troop.nb.s, strength, rank.s, ID, cohort, troop, mumID,sex)
+
+# Model
+prop_mod <- bf(strength ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + offset(log(scan_nb)) + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+# Poisson family
+mod.sptl.str <- brm(prop_mod, data=str.sptl.s2, family = poisson(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.sptl.str)
+summary(mod.sptl.str)
+
+# check for potential dispersion issue
+PosteriorPredictions <-predict(mod.sptl.str, summary=FALSE)
+PosteriorPredictions <- t(PosteriorPredictions)
+medianPosteriorPredictions<- apply(PosteriorPredictions,1,median)
+observations <- str.sptl.s2$strength
+Dharma <- createDHARMa(fittedPredictedResponse = medianPosteriorPredictions, simulatedResponse = PosteriorPredictions, observedResponse = observations, integerResponse = T)
+testDispersion<-testDispersion(Dharma, plot=T)
+
+# Negative binomial family
+str.sptl.s$new_strength<-str.sptl.s$strength -10
+
+prop_mod <- bf(new_strength ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + offset(log(scan_nb)) + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.sptl.str2 <- brm(prop_mod, data=str.sptl.s2, family = negbinomial(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.sptl.str2)
+summary(mod.sptl.str2)
+
+# check for potential dispersion issue
+PosteriorPredictions <-predict(mod.sptl.str2, summary=FALSE)
+PosteriorPredictions <- t(PosteriorPredictions)
+medianPosteriorPredictions<- apply(PosteriorPredictions,1,median)
+observations <- str.sptl.s2$new_strength 
+Dharma <- createDHARMa(fittedPredictedResponse = medianPosteriorPredictions, simulatedResponse = PosteriorPredictions, observedResponse = observations, integerResponse = T)
+testDispersion<-testDispersion(Dharma, plot=T)
+
+loo_compare(loo(mod.sptl.str2),loo(mod.sptl.str))
+
+```
+
+  # Cosine similarity
+
+```{r}
+# Scale our variables
+cos.sptl.f$age.s<-scale(cos.sptl.f$age)
+cos.sptl.f$scan.nb.s<-scale(cos.sptl.f$scan_nb)
+cos.sptl.f$NDVI.s<-scale(cos.sptl.f$NDVI)
+cos.sptl.f$troop.nb.s<-scale(cos.sptl.f$troop.nb)
+cos.sptl.f$rank.s<-scale(cos.sptl.f$rank_juve)
+
+cos.sptl.s<-cos.sptl.f%>%select(NDVI.s, scan.nb.s, age.s, troop.nb.s, cosine, rank.s, ID, cohort, troop, mumID,sex)
+cos.sptl.s<-cos.sptl.s[complete.cases(cos.sptl.s),]
+
+
+# Model
+prop_mod <- bf(cosine ~s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + s(scan.nb.s,bs="tp") + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.sptl.cos <- brm(prop_mod, data=cos.sptl.s, family = zero_one_inflated_beta(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.sptl.cos)
+summary(mod.sptl.cos)
+```
+
+  # Adult Rate
+
+```{r}
+rate.adult.sptl<-rate.sptl.f%>%filter(variable=="rate.adult")
+
+# Scale our variables
+rate.adult.sptl$NDVI.s<-scale(rate.adult.sptl$NDVI)
+rate.adult.sptl$scan.nb.s<-scale(rate.adult.sptl$scan_nb)
+rate.adult.sptl$age.s<-scale(rate.adult.sptl$age)
+rate.adult.sptl$troop.nb.s<-scale(rate.adult.sptl$troop.nb)
+rate.adult.sptl$value<-as.numeric(rate.adult.sptl$value)
+rate.adult.sptl$rank.s<-scale(rate.adult.sptl$rank_juve)
+
+rate.adult.sptl.s<-rate.adult.sptl%>%select(NDVI.s, scan.nb.s, age.s, troop.nb.s, value, rank.s, ID, cohort, troop, mumID, sex)
+
+# Model
+prop_mod <- bf(value ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + s(scan.nb.s,bs="tp") + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.sptl.prop.adult <- brm(prop_mod, data=rate.adult.sptl.s, family = zero_one_inflated_beta(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.sptl.prop.adult)
+summary(mod.sptl.prop.adult)
+```
+
+  # Family Rate
+
+```{r}
+rate.fam.sptl<-rate.sptl.f%>%filter(variable=="rate.family")
+
+# Scale our variables
+rate.fam.sptl$NDVI.s<-scale(rate.fam.sptl$NDVI)
+rate.fam.sptl$scan.nb.s<-scale(rate.fam.sptl$scan_nb)
+rate.fam.sptl$age.s<-scale(rate.fam.sptl$age)
+rate.fam.sptl$troop.nb.s<-scale(rate.fam.sptl$troop.nb)
+rate.fam.sptl$value<-as.numeric(rate.fam.sptl$value)
+rate.fam.sptl$rank.s<-scale(rate.fam.sptl$rank_juve)
+
+
+rate.fam.sptl.s<-rate.fam.sptl%>%select(NDVI.s, scan.nb.s, age.s, troop.nb.s, value, rank.s, ID, cohort, troop, mumID,sex)
+rate.fam.sptl.s<-rate.fam.sptl.s[complete.cases(rate.fam.sptl.s),]
+
+# Model
+
+prop_mod <- bf(value ~s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + s(scan.nb.s,bs="tp") + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.sptl.prop.fam <- brm(prop_mod, data=rate.fam.sptl.s, family = zero_one_inflated_beta(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.sptl.prop.fam)
+summary(mod.sptl.prop.fam)
+```
+
+## Grooming
+
+  # Degree
+
+```{r}
+degree.gr.s<-degree.gr.f[complete.cases(degree.gr.f),]
+# Scale our variables
+degree.gr.s$age.s<-scale(degree.gr.s$age)
+degree.gr.s$NDVI.s<-scale(degree.gr.s$NDVI)
+degree.gr.s$troop.nb.s<-scale(degree.gr.s$troop.nb)
+degree.gr.s$rank.s<-scale(degree.gr.s$rank_juve)
+
+degree.gr.s2 <-degree.gr.s%>%select(NDVI.s,scan_nb,age.s,troop.nb.s,degree,rank.s, ID,cohort, troop, mumID, sex)
+
+# Poisson family
+prop_mod <- bf(degree ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + offset(log(scan_nb)) + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.gr.degree <- brm(prop_mod, data=degree.gr.s2, family = poisson(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+summary(mod.gr.degree)
+pp_check(mod.gr.degree)
+
+# check for potential dispersion issue
+PosteriorPredictions <-predict(mod.gr.degree, summary=FALSE)
+PosteriorPredictions <- t(PosteriorPredictions)
+medianPosteriorPredictions<- apply(PosteriorPredictions,1,median)
+observations <- degree.gr.s2$degree
+Dharma <- createDHARMa(fittedPredictedResponse = medianPosteriorPredictions, simulatedResponse = PosteriorPredictions, observedResponse = observations, integerResponse = T)
+testDispersion<-testDispersion(Dharma, plot=T)
+
+# Negative binomial family
+degree.gr.s2$new_degree<-degree.gr.s2$degree -1
+
+prop_mod <- bf(new_degree ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + offset(log(scan_nb)) + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.gr.degree2 <- brm(prop_mod, data=degree.gr.s2, family = negbinomial(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.gr.degree2)
+summary(mod.gr.degree2)
+
+# check for potential dispersion issue
+PosteriorPredictions <-predict(mod.gr.degree2, summary=FALSE)
+PosteriorPredictions <- t(PosteriorPredictions)
+medianPosteriorPredictions<- apply(PosteriorPredictions,1,median)
+observations <- degree.gr.s2$new_degree
+Dharma <- createDHARMa(fittedPredictedResponse = medianPosteriorPredictions, simulatedResponse = PosteriorPredictions, observedResponse = observations, integerResponse = T)
+testDispersion<-testDispersion(Dharma, plot=T)
+
+loo_compare(loo(mod.gr.degree2), loo(mod.gr.degree))
+```
+
+  # Strength
+
+```{r}
+str.gr.s<-str.gr.f[complete.cases(str.gr.f),]
+# Scale our variables
+str.gr.s$age.s<-scale(str.gr.s$age)
+str.gr.s$NDVI.s<-scale(str.gr.s$NDVI)
+str.gr.s$troop.nb.s<-scale(str.gr.s$troop.nb)
+str.gr.s$rank.s<-scale(str.gr.s$rank_juve)
+
+str.gr.s2<-str.gr.s%>%select(NDVI.s,scan_nb,age.s,troop.nb.s,strength,rank.s, ID,cohort, troop, mumID, sex)
+
+
+# Poisson family
+prop_mod <- bf(strength ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + offset(log(scan_nb)) + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.gr.str <- brm(prop_mod, data=str.gr.s2, family = poisson(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.gr.str)
+summary(mod.gr.str)
+
+# check for potential dispersion issue
+PosteriorPredictions <-predict(mod.gr.str, summary=FALSE)
+PosteriorPredictions <- t(PosteriorPredictions)
+medianPosteriorPredictions<- apply(PosteriorPredictions,1,median)
+observations <- str.gr.s2$strength
+Dharma <- createDHARMa(fittedPredictedResponse = medianPosteriorPredictions, simulatedResponse = PosteriorPredictions, observedResponse = observations, integerResponse = T)
+testDispersion<-testDispersion(Dharma, plot=T)
+
+# Negative binomial family
+str.gr.s2$new_strength<-str.gr.s2$strength - min(str.gr.s2$strength)
+
+prop_mod <- bf(new_strength ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + offset(log(scan_nb)) + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.gr.str2 <- brm(prop_mod, data=str.gr.s2, family = negbinomial(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.gr.str2)
+summary(mod.gr.str2)
+
+# check for potential dispersion issue
+PosteriorPredictions <-predict(mod.gr.str2, summary=FALSE)
+PosteriorPredictions <- t(PosteriorPredictions)
+medianPosteriorPredictions<- apply(PosteriorPredictions,1,median)
+observations <- str.gr.s2$new_strength #this df can't have any NAs in it
+Dharma <- createDHARMa(fittedPredictedResponse = medianPosteriorPredictions, simulatedResponse = PosteriorPredictions, observedResponse = observations, integerResponse = T)
+testDispersion<-testDispersion(Dharma, plot=T)
+```
+
+  # Cosine similarity
+
+```{r}
+cos.gr.s<-cos.gr.f[complete.cases(cos.gr.f),]
+
+# Scale our variables
+cos.gr.s$age.s<-scale(cos.gr.s$age)
+cos.gr.s$scan.nb.s<-scale(cos.gr.s$scan_nb)
+cos.gr.s$NDVI.s<-scale(cos.gr.s$NDVI)
+cos.gr.s$troop.nb.s<-scale(cos.gr.s$troop.nb)
+cos.gr.s$rank.s<-scale(cos.gr.s$rank_juve)
+
+cos.gr.s2 <-cos.gr.s%>%select(NDVI.s,scan.nb.s,age.s,troop.nb.s,cosine,rank.s, ID, cohort, troop, mumID, sex)
+
+# Model
+prop_mod <- bf(cosine ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + s(scan.nb.s,bs="tp") + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.gr.cos <- brm(prop_mod, data=cos.gr.s2, family = zero_one_inflated_beta(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.gr.cos)
+summary(mod.gr.cos)
+```
+
+  # Rate adult 
+
+```{r}
+rate.adult.gr<-rate.gr.f%>%filter(variable=="rate.adult")
+
+# Scale our variables
+rate.adult.gr$NDVI.s<-scale(rate.adult.gr$NDVI)
+rate.adult.gr$scan.nb.s<-scale(rate.adult.gr$scan_nb)
+rate.adult.gr$age.s<-scale(rate.adult.gr$age)
+rate.adult.gr$troop.nb.s<-scale(rate.adult.gr$troop.nb)
+rate.adult.gr$value<-as.numeric(rate.adult.gr$value)
+rate.adult.gr$rank.s<-scale(rate.adult.gr$rank_juve)
+
+rate.adult.gr.s<-rate.adult.gr%>%select(NDVI.s,scan.nb.s,age.s,troop.nb.s,value,rank.s, ID,cohort,troop,mumID,sex)
+rate.adult.gr.s<-rate.adult.gr.s[complete.cases(rate.adult.gr.s),]
+
+# Model
+prop_mod <- bf(value ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + s(scan.nb.s,bs="tp") + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.gr.prop.adult <- brm(prop_mod, data=rate.adult.gr.s, family = zero_one_inflated_beta(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.gr.prop.adult)
+summary(mod.gr.prop.adult)
+```
+
+  # Rate family
+
+```{r}
+rate.fam.gr<-rate.gr.f%>%filter(variable=="rate.family")
+
+# Scale our variables
+rate.fam.gr$NDVI.s<-scale(rate.fam.gr$NDVI)
+rate.fam.gr$scan.nb.s<-scale(rate.fam.gr$scan_nb)
+rate.fam.gr$age.s<-scale(rate.fam.gr$age)
+rate.fam.gr$troop.nb.s<-scale(rate.fam.gr$troop.nb)
+rate.fam.gr$value<-as.numeric(rate.fam.gr$value)
+rate.fam.gr$rank.s<-scale(rate.fam.gr$rank_juve)
+
+rate.fam.gr.s<-rate.fam.gr%>%select(NDVI.s,scan.nb.s,age.s,troop.nb.s,value,rank.s, ID,cohort,troop,mumID,sex)
+rate.fam.gr.s<-rate.fam.gr.s[complete.cases(rate.fam.gr.s),]
+
+# Model
+prop_mod <- bf(value ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + s(scan.nb.s,bs="tp") + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.gr.prop.fam <- brm(prop_mod, data=rate.fam.gr.s, family = zero_one_inflated_beta(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.gr.prop.fam)
+summary(mod.gr.prop.fam)
+```
+
+### COSINE BETWEEN SPATIAL AND GROOMING BEHAVIOURS
+
+```{r}
+cos.btw.s<-cos.btw.f[complete.cases(cos.btw.f),]
+# Scale our variables
+cos.btw.s$age.s<-scale(cos.btw.s$age)
+cos.btw.s$scan.nb.s<-scale(cos.btw.s$scan_nb)
+cos.btw.s$NDVI.s<-scale(cos.btw.s$NDVI)
+cos.btw.s$troop.nb.s<-scale(cos.btw.s$troop.nb)
+cos.btw.s$rank.s<-scale(cos.btw.s$ranking)
+
+cos.btw.s2<-cos.btw.s%>%select(NDVI.s,scan.nb.s,age.s,troop.nb.s,cosine,rank.s, ID,cohort,troop,mumID,sex)
+
+
+# Model
+prop_mod <- bf(cosine ~ s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mumID, bs="fs", m=1) + s(scan.nb.s,bs="tp") + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.btw.cos <- brm(prop_mod, data=cos.btw.s2, family = zero_one_inflated_beta(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.btw.cos)
+summary(mod.btw.cos)
+```
+
+### COSINE BETWEEN MOTHER'S AND OFFSPRING'S GROOMING PARTNERS
+
+```{r}
+cos.gr.mum.off.f<-distinct(cos.gr.mum.off.f)
+cos.gr.mum.off.s<-cos.gr.mum.off.f%>%select(NDVI, scan_nb, age, troop.nb, cosine, ranking, ID, cohort, troop, mum,sex)
+
+# scale our variables
+cos.gr.mum.off.s$age.s<-scale(cos.gr.mum.off.s$age)
+cos.gr.mum.off.s$scan.nb.s<-scale(cos.gr.mum.off.s$scan_nb)
+cos.gr.mum.off.s$NDVI.s<-scale(cos.gr.mum.off.s$NDVI)
+cos.gr.mum.off.s$troop.nb.s<-scale(cos.gr.mum.off.s$troop.nb)
+cos.gr.mum.off.s$rank.s<-scale(cos.gr.mum.off.s$ranking)
+
+cos.gr.mum.off.s2<-cos.gr.mum.off.s[complete.cases(cos.gr.mum.off.s),]
+
+# Model
+prop_mod <- bf(cosine ~s(age.s, m=2) +  s(age.s, ID, bs="fs", m=1)+ s(age.s, cohort, bs="fs", m=1) + s(age.s, troop, bs="fs", m=1)+ s(age.s, mum, bs="fs", m=1) + s(scan.nb.s,bs="tp") + s(age.s, sex, bs="fs", m=1) + s(NDVI.s, bs="tp") +s(troop.nb.s, bs="tp")+s(rank.s,ID, bs="fs", m=1))
+
+mod.cos.mumoff <- brm(prop_mod, data=cos.gr.mum.off.s2, family = zero_one_inflated_beta(), prior=set_prior("normal(0,1)",class="b"), iter = 1000, chains=4, control = list(adapt_delta = 0.95, max_treedepth = 11),cores = 4, backend = "cmdstanr",threads = threading(10))
+
+pp_check(mod.cos.mumoff)
+summary(mod.cos.mumoff)
+```
+
+### MAKE PREDICTIONS
+
+## Spatial
+
+  # Degree
+  
+```{r}
+proto.sptl.degree <- conditional_effects(mod.sptl.degree2, 'age.s:sex', plot=FALSE)
+proto.degree.sptl<- as.data.frame(do.call(rbind.data.frame, proto.sptl.degree))
+
+# Create dataframe
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mumID= as.character("pouit"),troop.nb.s=1,scan_nb=1, NDVI.s=1, rank.s=1)
+
+names.of.ind<- unique(degree.sptl.s2$ID)
+
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-degree.sptl.s2%>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s), length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,"troop"], cohort=df.sub2[1,"cohort"], sex=df.sub2[1,"sex"], mumID= as.character(df.sub2[1,"mum"]),  troop.nb.s=proto.degree.sptl[1,"troop.nb.s"], scan_nb=proto.degree.sptl[1,"scan_nb"], NDVI.s=proto.degree.sptl[1,"NDVI.s"], rank.s=proto.degree.sptl[1,"rank.s"])
+  
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mumID<-as.character(df.pred$mumID)
+
+df.pred<-df.pred%>%droplevels()
+
+# Predictions
+pred_ID_degree_sptl <- fitted(mod.sptl.degree2, newdata = df.pred, summary=F, scale=c("response"))
+
+# Back transform
+fitted.degree.sptl<- as.data.frame(t(pred_ID_degree_sptl))
+
+pred.df.degree.sptl<-cbind(df.pred,fitted.degree.sptl) 
+
+mean_fitted_degree_sptl<-aggregate(x = pred.df.degree.sptl[,c(11:2010)], by = list(pred.df.degree.sptl$age.s, pred.df.degree.sptl$sex), FUN = mean)
+
+colnames(mean_fitted_degree_sptl)[1]<-"age.s"
+colnames(mean_fitted_degree_sptl)[2]<-"sex"
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.degree.sptl<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_degree_sptl)){
+  
+  temp.df$age.s<-mean_fitted_degree_sptl[each,1]
+  temp.df$sex<-mean_fitted_degree_sptl[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_degree_sptl[each,3:2002]))
+  global.ci<-apply(mean_fitted_degree_sptl[each,3:2002],1,HPDI, prob=0.95)
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.degree.sptl <- rbind(df.fitted.mean.degree.sptl, temp.df)
+}
+
+df.fitted.mean.degree.sptl$age<-df.fitted.mean.degree.sptl$age.s * attributes(degree.sptl.s$age.s)$`scaled:scale` + attributes(degree.sptl.s$age.s)$`scaled:center`
+
+df.fitted.mean.degree.sptl$age<-(as.integer(df.fitted.mean.degree.sptl$age))
+df.fitted.mean.degree.sptl$sex<-as.factor(df.fitted.mean.degree.sptl$sex)
+
+df.degree.sptl.restricted<-df.fitted.mean.degree.sptl%>% filter(age>224)
+
+degree.sptl.fig<-ggplot(data=df.degree.sptl.restricted, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.degree.sptl.restricted, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs(title = "", x = "Age (days)", y = "Degree", tag = "a")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue")) + theme(legend.position = "none",axis.text.x=element_text(size=13),axis.text.y=element_text(size=13),axis.title=element_text(size=14))
+
+plot.raw.degree.sptl<-ggplot() +
+  # raw plot
+  geom_point(data=degree.sptl.s2, aes(x=age, y=degree),color="lightgrey", size=0.8) + 
+  # predicted plot
+  geom_line(data=df.degree.sptl.restricted, aes(x=age, y=mean, color=sex), size=1)+
+  geom_ribbon(data=df.degree.sptl.restricted, aes(x=age, y=mean,ymin=lci, ymax=uci, fill=sex),color=NA, alpha=0.5)+ theme_classic() +  labs( x = "Age (days)", y = "Degree", tag = "a")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))
+```
+
+  # Strength
+    
+```{r}
+proto.sptl.str <- conditional_effects(mod.sptl.str2, 'age.s:sex', plot=FALSE)
+proto.str.sptl.df <- as.data.frame(do.call(rbind.data.frame, proto.sptl.str))
+
+# Create dataframe
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mumID= as.character("pouit"),troop.nb.s=1,scan_nb=1, NDVI.s=1, rank.s=1)
+
+names.of.ind<- unique(str.sptl.juve.s2$ID)
+
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-str.sptl.juve.s2%>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s),length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,"troop"], cohort=df.sub2[1,"cohort"], sex=df.sub2[1,"sex"], mumID= as.character(df.sub2[1,"mumID"]),  troop.nb.s=proto.str.sptl.df[1,"troop.nb.s"], scan_nb=proto.str.sptl.df[1,"scan_nb"], NDVI.s=proto.str.sptl.df[1,"NDVI.s"], rank.s=proto.str.sptl.df[1,"rank.s"])
+  
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mumID<-as.character(df.pred$mumID)
+
+df.pred<-df.pred%>%droplevels()
+
+# Predictions
+pred_ID_str_sptl <- fitted(mod.sptl.str2, newdata = df.pred, summary=F, scale=c("response"))
+
+# Back transform
+fitted.str.sptl<- as.data.frame(t(pred_ID_str_sptl))
+
+pred.df.str.sptl<-cbind(df.pred,fitted.str.sptl) 
+
+mean_fitted_str_sptl<-aggregate(x = pred.df.str.sptl[,c(11:2010)], by = list(pred.df.str.sptl$age.s, pred.df.str.sptl$sex), FUN = mean)
+
+colnames(mean_fitted_str_sptl)[1]<-"age.s"
+colnames(mean_fitted_str_sptl)[2]<-"sex"
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.str.sptl<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_str_sptl)){
+  
+  temp.df$age.s<-mean_fitted_str_sptl[each,1]
+  temp.df$sex<-mean_fitted_str_sptl[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_str_sptl[each,3:2002]))
+  global.ci<-apply(mean_fitted_str_sptl[each,3:2002],1,HPDI, prob=0.95)
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.str.sptl <- rbind(df.fitted.mean.str.sptl, temp.df)
+}
+
+df.fitted.mean.str.sptl$age<-df.fitted.mean.str.sptl$age.s * attributes(str.sptl.s$age.s)$`scaled:scale` + attributes(str.sptl.s$age.s)$`scaled:center`
+
+df.fitted.mean.str.sptl$age<-(as.integer(df.fitted.mean.str.sptl$age))
+df.fitted.mean.str.sptl$sex<-as.factor(df.fitted.mean.str.sptl$sex)
+
+df.str.sptl.restricted<-df.fitted.mean.str.sptl%>% filter(age>224&age<1200)
+
+str.sptl.fig<-ggplot(data=df.str.sptl.restricted, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.str.sptl.restricted, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs(title = "", x = "Age (days)", y = "Strength", tag = "b")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))+ theme(legend.position = "none",axis.text.x=element_text(size=13),axis.text.y=element_text(size=13),axis.title=element_text(size=14))
+
+plot.raw.str.sptl<-ggplot() +
+  # raw plot
+  geom_point(data=str.sptl.s2, aes(x=age, y=strength),color="lightgrey", size=0.8) + 
+  # predicted plot
+  geom_line(data=df.str.sptl.restricted, aes(x=age, y=mean, color=sex), size=1)+
+  geom_ribbon(data=df.str.sptl.restricted, aes(x=age, y=mean,ymin=lci, ymax=uci, fill=sex),color=NA, alpha=0.5)+ theme_classic() +  labs( x = "Age (days)", y = "Strength", tag = "b")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))
+```
+  
+  # Cosine similarity
+
+```{r}
+proto.sptl.cos <- conditional_effects(mod.sptl.cos, 'age.s:sex', plot=FALSE)
+proto.cos.sptl<- as.data.frame(do.call(rbind.data.frame, proto.sptl.cos)) 
+
+# Create dataframe
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mumID= as.character("pouit"), troop.nb.s=1,scan.nb.s=1, NDVI.s=1, rank.s=1)
+
+names.of.ind<- unique(cos.sptl.s$ID)
+
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-cos.sptl.s%>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s), length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,"troop"], cohort=df.sub2[1,"cohort"], sex=df.sub2[1,"sex"], mumID= as.character(df.sub2[1,"mumID"]),  troop.nb.s=proto.cos.sptl[1,"troop.nb.s"], scan.nb.s=proto.cos.sptl[1,"scan.nb.s"], NDVI.s=proto.cos.sptl[1,"NDVI.s"], rank.s=proto.cos.sptl[1,"rank.s"])
+
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mumID<-as.character(df.pred$mumID)
+
+df.pred<-df.pred%>%droplevels()
+
+# Predictions
+pred_cos_sptl<- fitted(mod.sptl.cos, newdata = df.pred, summary=F, scale=c("response"))
+
+# Back transform
+fitted.cos.sptl<- as.data.frame(t(pred_cos_sptl))
+
+pred.cos.sptl<-cbind(df.pred,fitted.cos.sptl) 
+
+mean_fitted_cos_sptl_sex<-aggregate(x = pred.cos.sptl[,c(11:2010)], by = list(pred.cos.sptl$age.s, pred.cos.sptl$sex), FUN = mean)
+
+colnames(mean_fitted_cos_sptl_sex)[1]<-"age.s"
+colnames(mean_fitted_cos_sptl_sex)[2]<-"sex"
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.cos.sptl<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_cos_sptl_sex)){
+  
+  temp.df$age.s<-mean_fitted_cos_sptl_sex[each,1]
+  temp.df$sex<-mean_fitted_cos_sptl_sex[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_cos_sptl_sex[each,3:2002]))
+  global.ci<-apply(mean_fitted_cos_sptl_sex[each,3:2002],1,HPDI, prob=0.95)
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.cos.sptl <- rbind(df.fitted.mean.cos.sptl, temp.df)
+}
+
+df.fitted.mean.cos.sptl$age<-df.fitted.mean.cos.sptl$age.s * attributes(cos.sptl.f$age.s)$`scaled:scale` + attributes(cos.sptl.f$age.s)$`scaled:center`
+
+df.fitted.mean.cos.sptl$age<-(as.integer(df.fitted.mean.cos.sptl$age))
+df.fitted.mean.cos.sptl$sex<-as.factor(df.fitted.mean.cos.sptl$sex)
+
+df.cos.sptl.restricted <-df.fitted.mean.cos.sptl%>%filter(age>224)
+
+cosine.sptl.fig<-ggplot(data=df.cos.sptl.restricted, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.cos.sptl.restricted, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs( x = "Age (days)", y = "Cosine similarity", tag="c")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue")) +ylim(0.25,0.9)+ theme(legend.position = "none", axis.text.x=element_text(size=13), axis.text.y= element_text(size=13), axis.title=element_text(size=14))
+
+plot.raw.cos.sptl<-ggplot() +
+  # raw plot
+  geom_point(data=cos.sptl.s, aes(x=age, y=cosine),color="lightgrey", size=0.8) + 
+  # predicted plot
+  geom_line(data=df.cos.sptl.restricted, aes(x=age, y=mean, color=sex), size=1)+
+  geom_ribbon(data=df.cos.sptl.restricted, aes(x=age, y=mean,ymin=lci, ymax=uci, fill=sex),color=NA, alpha=0.5)+ theme_classic() +  labs( x = "Age (days)", y = "Cosine similarity")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))
+
+```
+
+ # Rate Adult
+  
+```{r}
+proto.sptl.adult <- conditional_effects(mod.sptl.prop.adult, 'age.s:sex', plot=FALSE)
+proto.adult.sptl<- as.data.frame(do.call(rbind.data.frame, proto.sptl.adult))
+
+# Create dataframe
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mumID= as.character("pouit"), troop.nb.s=1,scan.nb.s=1, NDVI.s=1, rank.s=1)
+
+names.of.ind<- unique(rate.adult.sptl.s$ID)
+
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-rate.adult.sptl.s%>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s), length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,"troop"], cohort= df.sub2[1,"cohort"], sex=df.sub2[1,"sex"], mumID= as.character(df.sub2[1,"mumID"]), troop.nb.s=proto.adult.sptl[1,"troop.nb.s"], scan.nb.s= proto.adult.sptl[1,"scan.nb.s"], NDVI.s=proto.adult.sptl[1,"NDVI.s"], rank.s=proto.adult.sptl[1,"rank.s"])
+
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mumID<-as.character(df.pred$mumID)
+
+df.pred<-df.pred%>%droplevels()
+
+# Predictions
+pred_adult_sptl<- fitted(mod.sptl.prop.adult, newdata = df.pred, summary=F, scale=c("response"))
+
+# Back transform
+fitted.adult.sptl<- as.data.frame(t(pred_adult_sptl))
+
+pred.adult.sptl<-cbind(df.pred,fitted.adult.sptl) 
+
+mean_fitted_adult_sptl<-aggregate(x = pred.adult.sptl[,c(10:2009)], by = list(pred.adult.sptl$age.s, pred.adult.sptl$sex), FUN = mean)
+
+colnames(mean_fitted_adult_sptl)[1]<-"age.s"
+colnames(mean_fitted_adult_sptl)[2]<-"sex"
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.adult.sptl<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_adult_sptl)){
+  
+  temp.df$age.s<-mean_fitted_adult_sptl[each,1]
+  temp.df$sex<-mean_fitted_adult_sptl[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_adult_sptl[each,3:2002]))
+  global.ci<-apply(mean_fitted_adult_sptl[each,3:2002],1,HPDI, prob=0.95)
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.adult.sptl <- rbind(df.fitted.mean.adult.sptl, temp.df)
+}
+
+rate.adult.sptl<-rate.sptl.f%>%filter(variable=="rate.adult")
+df.fitted.mean.adult.sptl$age<-df.fitted.mean.adult.sptl$age.s * attributes(rate.adult.sptl$age.s)$`scaled:scale` + attributes(rate.adult.sptl$age.s)$`scaled:center`
+
+
+df.fitted.mean.adult.sptl$age<-(as.integer(df.fitted.mean.adult.sptl$age))
+df.fitted.mean.adult.sptl$sex<-as.factor(df.fitted.mean.adult.sptl$sex)
+
+df.adult.sptl.restricted <-df.fitted.mean.adult.sptl%>%filter(age>224 & age<1200)
+
+ad.sptl.fig<-ggplot(data=df.adult.sptl.restricted, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.adult.sptl.restricted, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs( x = "Age (days)", y = "Association rate with adults", tag = "a")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue")) +ylim(0,0.4)+ theme(legend.position = "none",axis.text.x=element_text(size=13), axis.text.y=element_text(size=13), axis.title=element_text(size=14))
+
+plot.raw.ad.sptl<-ggplot() +
+  # raw plot
+  geom_point(data=rate.adult.sptl, aes(x=age, y=value),color="lightgrey", size=0.8) + 
+  # predicted plot
+  geom_line(data=df.adult.sptl.restricted, aes(x=age, y=mean, color=sex), size=1)+
+  geom_ribbon(data=df.adult.sptl.restricted, aes(x=age, y=mean,ymin=lci, ymax=uci, fill=sex),color=NA, alpha=0.5)+ theme_classic() +  labs( x = "Age (days)", y = "Rate of associations with adults", tag = "c")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))
+```
+  
+  # Rate family
+  
+```{r}
+proto.sptl.fam <- conditional_effects(mod.sptl.prop.fam, 'age.s:sex', plot=FALSE)
+proto.fam.sptl<- as.data.frame(do.call(rbind.data.frame, proto.sptl.fam)) 
+
+# Create dataframe
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mumID= as.character("pouit"), troop.nb.s=1,scan.nb.s=1, NDVI.s=1,rank.s=1)
+
+names.of.ind<- unique(rate.fam.sptl.s$ID)
+
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-rate.fam.sptl.s%>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s),length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,9], cohort=df.sub2[1,8], sex=df.sub2[1,11], mumID= as.character(df.sub2[1,10]),  troop.nb.s=proto.fam.sptl[1,10], scan.nb.s=proto.fam.sptl[1,8], NDVI.s=proto.fam.sptl[1,9], rank.s=proto.fam.sptl[1,11])
+  
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mumID<-as.character(df.pred$mumID)
+
+df.pred<-df.pred%>%droplevels()
+
+# Predictions
+pred_fam_sptl<- fitted(mod.sptl.prop.fam, newdata = df.pred, summary=F, scale=c("response"))
+
+# BACK TRANSFORM AFTER FITTED BEFORE MAKING MEANS
+fitted.fam.sptl<- as.data.frame(t(pred_fam_sptl))
+
+# biiiiind
+pred.fam.sptl<-cbind(df.pred,fitted.fam.sptl) 
+
+mean_fitted_fam_sptl<-aggregate(x = pred.fam.sptl[,c(11:2010)], by = list(pred.fam.sptl$age.s, pred.fam.sptl$sex), FUN = mean)
+
+colnames(mean_fitted_fam_sptl)[1]<-"age.s"
+colnames(mean_fitted_fam_sptl)[2]<-"sex"
+
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.fam.sptl<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_fam_sptl)){
+  
+  temp.df$age.s<-mean_fitted_fam_sptl[each,1]
+  temp.df$sex<-mean_fitted_fam_sptl[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_fam_sptl[each,3:2002]))
+  global.ci<-apply(mean_fitted_fam_sptl[each,3:2002],1,HPDI, prob=0.95)
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.fam.sptl <- rbind(df.fitted.mean.fam.sptl, temp.df)
+}
+
+df.fitted.mean.fam.sptl$age<-df.fitted.mean.fam.sptl$age.s * attributes(rate.fam.sptl$age.s)$`scaled:scale` + attributes(rate.fam.sptl$age.s)$`scaled:center`
+
+df.fitted.mean.fam.sptl$age<-(as.integer(df.fitted.mean.fam.sptl$age))
+df.fitted.mean.fam.sptl$sex<-as.factor(df.fitted.mean.fam.sptl$sex)
+
+df.fam.sptl.restricted <-df.fitted.mean.fam.sptl%>%filter(age>224)
+
+fam.sptl.fig<-ggplot(data=df.fam.sptl.restricted, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.fam.sptl.restricted, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs( x = "Age (days)", y = "Family members association rate", tag = "b")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))+ylim(0,0.4)+ theme(legend.position = "none",axis.text.x=element_text(size=13), axis.text.y=element_text(size=13), axis.title=element_text(size=14))
+
+plot.raw.fam.sptl<-ggplot() +
+  # raw plot
+  geom_point(data=rate.fam.sptl.s, aes(x=age, y=value),color="lightgrey", size=0.8) + 
+  # predicted plot
+  geom_line(data=df.fam.sptl.restricted, aes(x=age, y=mean, color=sex), size=1)+
+  geom_ribbon(data=df.fam.sptl.restricted, aes(x=age, y=mean,ymin=lci, ymax=uci, fill=sex),color=NA, alpha=0.5)+ theme_classic() +  labs( x = "Age (days)", y = "Rate of associations with family members", tag = "d")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))
+```
+
+## Grooming
+
+  # Degree
+  
+```{r}
+proto.gr.degree <- conditional_effects(mod.gr.degree2, 'age.s:sex', plot=FALSE)
+proto.degree.gr.df<- as.data.frame(do.call(rbind.data.frame, proto.gr.degree)) 
+
+#  Create dataframe
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mumID= as.character("pouit"),troop.nb.s=1,scan_nb=1, NDVI.s=1, rank.s=1)
+
+names.of.ind<- unique(degree.gr.s2$ID)
+
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-degree.gr.s2%>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s), length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,"troop"], cohort=df.sub2[1,"cohort"], sex=df.sub2[1,"sex"], mumID= as.character(df.sub2[1,"mumID"]),  troop.nb.s=proto.degree.gr.df[1,"troop.nb.s"], scan_nb=proto.degree.gr.df[1,"scan_nb"], NDVI.s=proto.degree.gr.df[1,"NDVI.s"], rank.s=proto.degree.gr.df[1,"rank.s"])
+  
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mumID<-as.character(df.pred$mumID)
+
+df.pred<-df.pred%>%droplevels()
+
+# Predictions
+pred_ID_degree_gr <- fitted(mod.gr.degree2, newdata = df.pred, summary=F, scale=c("response"))
+
+# Back transform
+fitted.degree.gr<- as.data.frame(t(pred_ID_degree_gr))
+pred.df.degree.gr<-cbind(df.pred,fitted.degree.gr) 
+
+mean_fitted_degree_gr<-aggregate(x = pred.df.degree.gr[,c(11:2010)], by = list(pred.df.degree.gr$age.s, pred.df.degree.gr$sex), FUN = mean)
+colnames(mean_fitted_degree_gr)[1]<-"age.s"
+colnames(mean_fitted_degree_gr)[2]<-"sex"
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.degree.gr<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_degree_gr)){
+  
+  temp.df$age.s<-mean_fitted_degree_gr[each,1]
+  temp.df$sex<-mean_fitted_degree_gr[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_degree_gr[each,3:2002])) +1 # to bring it back to the right nb of degree
+  global.ci<-apply(mean_fitted_degree_gr[each,3:2002],1,HPDI, prob=0.95) +1
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.degree.gr <- rbind(df.fitted.mean.degree.gr, temp.df)
+}
+
+df.fitted.mean.degree.gr$age<-df.fitted.mean.degree.gr$age.s * attributes(degree.gr.f$age.s)$`scaled:scale` + attributes(degree.gr.f$age.s)$`scaled:center`
+
+df.fitted.mean.degree.gr$age<-(as.integer(df.fitted.mean.degree.gr$age))
+df.fitted.mean.degree.gr$sex<-as.factor(df.fitted.mean.degree.gr$sex)
+
+df.degree.gr.restricted<-df.fitted.mean.degree.gr%>% filter(age>224)
+
+degree.gr.fig2<-ggplot(data=df.degree.gr.restricted, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+  geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.degree.gr.restricted, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs(title = "", x = "Age (days)", y = "Degree", tag = "a")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))+ theme(legend.position = "none",axis.text.x=element_text(size=13), axis.text.y=element_text(size=13), axis.title=element_text(size=14))#
+
+plot.raw.degree.gr<-ggplot() +
+  # raw plot
+  geom_point(data=degree.gr.s2, aes(x=age, y=degree),color="lightgrey", size=0.8) + 
+  # predicted plot
+  geom_line(data=df.degree.gr.restricted, aes(x=age, y=mean, color=sex), size=1)+
+  geom_ribbon(data=df.degree.gr.restricted, aes(x=age, y=mean,ymin=lci, ymax=uci, fill=sex),color=NA, alpha=0.5)+ theme_classic() +  labs( x = "Age (days)", y = "Degree", tag = "a")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))
+```
+
+  # Strength
+  
+```{r}
+proto.gr.str <- conditional_effects(mod.gr.str, 'age.s:sex', plot=FALSE)
+proto.str.gr.df<- as.data.frame(do.call(rbind.data.frame, proto.gr.str)) 
+
+# Create dataframe
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mumID= as.character("pouit"),troop.nb.s=1,scan_nb=1, NDVI.s=1, rank.s=1)
+
+names.of.ind<- unique(str.gr.s2$ID)
+
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-str.gr.s2%>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s), length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,"troop"], cohort=df.sub2[1,"cohort"], sex=df.sub2[1,"sex"], mumID= as.character(df.sub2[1,"mumID"]),  troop.nb.s=proto.str.gr.df[1,"troop.nb.s"], scan_nb=proto.str.gr.df[1,"scan_nb"], NDVI.s=proto.str.gr.df[1,"NDVI.s"], rank.s=proto.str.gr.df[1,"rank.s"])
+  
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mumID<-as.character(df.pred$mumID)
+
+df.pred<-df.pred%>%droplevels()
+
+# Predictions
+pred_ID_str_gr<- fitted(mod.gr.str, newdata = df.pred, summary=F, scale=c("response"))
+
+# Back transform
+fitted.str.gr<- as.data.frame(t(pred_ID_str_gr))
+pred.df.str.gr<-cbind(df.pred,fitted.str.gr) 
+
+mean_fitted_str_gr<-aggregate(x = pred.df.str.gr[,c(11:2010)], by = list(pred.df.str.gr$age.s, pred.df.str.gr$sex), FUN = mean)
+colnames(mean_fitted_str_gr)[1]<-"age.s"
+colnames(mean_fitted_str_gr)[2]<-"sex"
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.str.gr<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_str_gr)){
+  
+  temp.df$age.s<-mean_fitted_str_gr[each,1]
+  temp.df$sex<-mean_fitted_str_gr[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_str_gr[each,3:2002]))
+  global.ci<-apply(mean_fitted_str_gr[each,3:2002],1,HPDI, prob=0.95)
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.str.gr <- rbind(df.fitted.mean.str.gr, temp.df)
+}
+
+df.fitted.mean.str.gr$age<-df.fitted.mean.str.gr$age.s * attributes(str.gr.f$age.s)$`scaled:scale` + attributes(str.gr.f$age.s)$`scaled:center`
+
+df.fitted.mean.str.gr$age<-(as.integer(df.fitted.mean.str.gr$age))
+df.fitted.mean.str.gr$sex<-as.factor(df.fitted.mean.str.gr$sex)
+
+df.str.gr.restricted<-df.fitted.mean.str.gr%>% filter(age>224&age<1200)
+
+str.gr.fig <-ggplot(data=df.str.gr.restricted, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.str.gr.restricted, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs(title = "", x = "Age (days)", y = "Strength", tag="b")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))+ theme(legend.position = "none",axis.text.x=element_text(size=13), axis.text.y=element_text(size=13), axis.title=element_text(size=14))
+
+plot.raw.str.gr<-ggplot() +
+  # raw plot
+  geom_point(data=str.gr.s2, aes(x=age, y=strength),color="lightgrey", size=0.8) + 
+  # predicted plot
+  geom_line(data=df.str.gr.restricted, aes(x=age, y=mean, color=sex), size=1)+
+  geom_ribbon(data=df.str.gr.restricted, aes(x=age, y=mean,ymin=lci, ymax=uci, fill=sex),color=NA, alpha=0.5)+ theme_classic() +  labs( x = "Age (days)", y = "Strength", tag = "b")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))
+
+```
+
+  # Cosine similarity
+  
+```{r}
+proto.gr.cos <- conditional_effects(mod.gr.cos, 'age.s:sex', plot=FALSE)
+proto.cos.gr<- as.data.frame(do.call(rbind.data.frame, proto.gr.cos))
+
+# Create dataframe
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mumID= as.character("pouit"), troop.nb.s=1,scan.nb.s=1, NDVI.s=1, rank.s=1)
+
+names.of.ind<- unique(cos.gr.s2$ID)
+
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-cos.gr.s2%>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s), length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,"troop"], cohort=df.sub2[1,"cohort"], sex=df.sub2[1,"sex"], mumID= as.character(df.sub2[1,"mumID"]),  troop.nb.s=proto.cos.gr[1,"troop.nb.s"], scan.nb.s=proto.cos.gr[1,"scan.nb.s"], NDVI.s=proto.cos.gr[1,"NDVI.s"], rank.s=proto.cos.gr[1,"rank.s"])
+
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mumID<-as.character(df.pred$mumID)
+
+df.pred<-df.pred%>%droplevels()
+
+# Predictions
+pred_cos_gr<- fitted(mod.gr.cos, newdata = df.pred, summary=F, scale=c("response"))
+
+# Back transform
+fitted.cos.gr<- as.data.frame(t(pred_cos_gr))
+pred.cos.gr<-cbind(df.pred,fitted.cos.gr) 
+
+mean_fitted_cos_gr<-aggregate(x = pred.cos.gr[,c(11:2010)], by = list(pred.cos.gr$age.s, pred.cos.gr$sex), FUN = mean)
+
+colnames(mean_fitted_cos_gr)[1]<-"age.s"
+colnames(mean_fitted_cos_gr)[2]<-"sex"
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.cos.gr<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_cos_gr)){
+  
+  temp.df$age.s<-mean_fitted_cos_gr[each,1]
+  temp.df$sex<-mean_fitted_cos_gr[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_cos_gr[each,3:2002]))
+  global.ci<-apply(mean_fitted_cos_gr[each,3:2002],1,HPDI, prob=0.95)
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.cos.gr <- rbind(df.fitted.mean.cos.gr, temp.df)
+}
+
+df.fitted.mean.cos.gr$age<-df.fitted.mean.cos.gr$age.s * attributes(cos.gr.f$age.s)$`scaled:scale` + attributes(cos.gr.f$age.s)$`scaled:center`
+
+df.fitted.mean.cos.gr$age<-(as.integer(df.fitted.mean.cos.gr$age))
+df.fitted.mean.cos.gr$sex<-as.factor(df.fitted.mean.cos.gr$sex)
+
+df.cos.gr.restricted <-df.fitted.mean.cos.gr%>%filter(age>224& age<1200)
+
+cosine.gr.fig<-ggplot(data=df.cos.gr.restricted, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+  geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.cos.gr.restricted, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs( x = "Age (days)", y = "Cosine similarity", tag="c")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))+ theme(legend.position = "none",axis.text.x=element_text(size=13), axis.text.y=element_text(size=13), axis.title=element_text(size=14)) +ylim(0.75,1)
+
+plot.raw.cos.gr<-ggplot() +
+  # raw plot
+  geom_point(data=cos.gr.s2, aes(x=age, y=cosine),color="lightgrey", size=0.8) + 
+  # predicted plot
+  geom_line(data=df.cos.gr.restricted, aes(x=age, y=mean, color=sex), size=1)+
+  geom_ribbon(data=df.cos.gr.restricted, aes(x=age, y=mean,ymin=lci, ymax=uci, fill=sex),color=NA, alpha=0.5)+ theme_classic() +  labs( x = "Age (days)", y = "Cosine similarity")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))
+```
+
+  # Adult rate
+    
+```{r}
+proto.gr.adult <- conditional_effects(mod.gr.prop.adult, 'age.s:sex', plot=FALSE)
+proto.adult.gr<- as.data.frame(do.call(rbind.data.frame, proto.gr.adult)) # allows us to get the mean for all predictors
+
+#  ID lines
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mumID= as.character("pouit"), troop.nb.s=1,scan.nb.s=1, NDVI.s=1, rank.s=1)
+#max(data.all.var$age.s)
+
+#names.of.mums<- unique(selected.data$mumID)
+
+
+names.of.ind<- unique(rate.adult.gr.s$ID)
+
+#i<-1
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-rate.adult.gr.s%>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s),length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,3], cohort=df.sub2[1,6], sex=df.sub2[1,7], mumID= as.character(df.sub2[1,12]),  troop.nb.s=proto.adult.gr[1,10], scan.nb.s=proto.adult.gr[1,8], NDVI.s=proto.adult.gr[1,9],rank.s=proto.adult.gr[1,11])
+  
+  # df.temp<-df.temp%>% filter(!(age.s>max(df.sub2$age.s))) # get rid of age past their true observed one
+  
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mumID<-as.character(df.pred$mumID)
+
+df.pred<-df.pred%>%droplevels()
+
+# Predictions
+pred_adult_gr<- fitted(mod.gr.prop.adult, newdata = df.pred, summary=F, scale=c("response"))
+
+
+# BACK TRANSFORM AFTER FITTED BEFORE MAKING MEANS
+fitted.adult.gr<- as.data.frame(t(pred_adult_gr))
+
+# biiiiind
+pred.adult.gr<-cbind(df.pred,fitted.adult.gr) 
+
+mean_fitted_adult_gr<-aggregate(x = pred.adult.gr[,c(11:2010)], by = list(pred.adult.gr$age.s, pred.adult.gr$sex), FUN = mean)
+
+colnames(mean_fitted_adult_gr)[1]<-"age.s"
+colnames(mean_fitted_adult_gr)[2]<-"sex"
+
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.adult.gr<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_adult_gr)){
+  
+  temp.df$age.s<-mean_fitted_adult_gr[each,1]
+  temp.df$sex<-mean_fitted_adult_gr[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_adult_gr[each,3:2002]))
+  global.ci<-apply(mean_fitted_adult_gr[each,3:2002],1,HPDI, prob=0.95)
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.adult.gr <- rbind(df.fitted.mean.adult.gr, temp.df)
+}
+
+
+df.fitted.mean.adult.gr$age<-df.fitted.mean.adult.gr$age.s * attributes(rate.adult.gr$age.s)$`scaled:scale` + attributes(rate.adult.gr$age.s)$`scaled:center`
+
+
+df.fitted.mean.adult.gr$age<-(as.integer(df.fitted.mean.adult.gr$age))
+df.fitted.mean.adult.gr$sex<-as.factor(df.fitted.mean.adult.gr$sex)
+
+df.adult.gr.restricted <-df.fitted.mean.adult.gr%>%filter(age>224 &age<1200)
+
+adult.gr.fig<-ggplot(data=df.adult.gr.restricted, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+  geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.adult.gr.restricted, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs( x = "Age (days)", y = "Adults association rate", tag="a")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue")) +ylim(0.85,1)+ theme(legend.position = "none",axis.text.x=element_text(size=13), axis.text.y=element_text(size=13), axis.title=element_text(size=14))
+
+plot.raw.ad.gr<-ggplot() +
+  # raw plot
+  geom_point(data=rate.adult.gr, aes(x=age, y=value),color="lightgrey", size=0.8) + 
+  # predicted plot
+  geom_line(data=df.adult.gr.restricted, aes(x=age, y=mean, color=sex), size=1)+
+  geom_ribbon(data=df.adult.gr.restricted, aes(x=age, y=mean,ymin=lci, ymax=uci, fill=sex),color=NA, alpha=0.5)+ theme_classic() +  labs( x = "Age (days)", y = "Rate of associations with adults", tag = "a")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))
+```
+  
+  # Family rate
+  
+```{r}
+proto.gr.fam <- conditional_effects(mod.gr.prop.fam, 'age.s:sex', plot=FALSE)
+proto.fam.gr<- as.data.frame(do.call(rbind.data.frame, proto.gr.fam)) 
+
+# Create dataframe
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mumID= as.character("pouit"), troop.nb.s=1,scan.nb.s=1, NDVI.s=1,rank.s=1)
+
+names.of.ind<- unique(rate.fam.gr.s$ID)
+
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-rate.fam.gr.s%>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s), length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,"troop"], cohort=df.sub2[1,"cohort"], sex=df.sub2[1,"sex"], mumID= as.character(df.sub2[1,"mumID"]),  troop.nb.s=proto.fam.gr[1,"troop.nb.s"], scan.nb.s=proto.fam.gr[1,"scan.nb.s"], NDVI.s=proto.fam.gr[1,"NDVI.s"],rank.s=proto.fam.gr[1,"rank.s"])
+  
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mumID<-as.character(df.pred$mumID)
+
+df.pred<-df.pred%>%droplevels()
+
+# Predictions
+pred_fam_gr<- fitted(mod.gr.prop.fam, newdata = df.pred, summary=F, scale=c("response"))
+
+# Back transform
+fitted.fam.gr<- as.data.frame(t(pred_fam_gr))
+pred.fam.gr<-cbind(df.pred,fitted.fam.gr) 
+
+mean_fitted_fam_gr<-aggregate(x = pred.fam.gr[,c(11:2010)], by = list(pred.fam.gr$age.s, pred.fam.gr$sex), FUN = mean)
+
+colnames(mean_fitted_fam_gr)[1]<-"age.s"
+colnames(mean_fitted_fam_gr)[2]<-"sex"
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.fam.gr<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_fam_gr)){
+  
+  temp.df$age.s<-mean_fitted_fam_gr[each,1]
+  temp.df$sex<-mean_fitted_fam_gr[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_fam_gr[each,3:2002]))
+  global.ci<-apply(mean_fitted_fam_gr[each,3:2002],1,HPDI, prob=0.95)
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.fam.gr <- rbind(df.fitted.mean.fam.gr, temp.df)
+}
+
+df.fitted.mean.fam.gr$age<-df.fitted.mean.fam.gr$age.s * attributes(rate.fam.gr$age.s)$`scaled:scale` + attributes(rate.fam.gr$age.s)$`scaled:center`
+
+df.fitted.mean.fam.gr$age<-(as.integer(df.fitted.mean.fam.gr$age))
+df.fitted.mean.fam.gr$sex<-as.factor(df.fitted.mean.fam.gr$sex)
+
+df.fam.gr.restricted <-df.fitted.mean.fam.gr%>%filter(age>224 & age<1200)
+
+fam.gr.fig<-ggplot(data=df.fam.gr.restricted, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+  geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.fam.gr.restricted, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs( x = "Age (days)", y = "Family members association rate", tag="b")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue")) +ylim(0.85,1)+ theme(legend.position = "none",axis.text.x=element_text(size=13), axis.text.y=element_text(size=13), axis.title=element_text(size=14))
+
+plot.raw.fam.gr<-ggplot() +
+  # raw plot
+  geom_point(data=rate.fam.gr, aes(x=age, y=value),color="lightgrey", size=0.8) + 
+  # predicted plot
+  geom_line(data=df.fam.gr.restricted, aes(x=age, y=mean, color=sex), size=1)+
+  geom_ribbon(data=df.fam.gr.restricted, aes(x=age, y=mean,ymin=lci, ymax=uci, fill=sex),color=NA, alpha=0.5)+ theme_classic() +  labs( x = "Age (days)", y = "Rate of associations with family members", tag = "d")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))
+```
+
+## Cosine between spatial and grooming partners
+
+```{r}
+proto.btw.cos <- conditional_effects(mod.btw.cos, 'age.s:sex', plot=FALSE)
+proto.cos.btw<- as.data.frame(do.call(rbind.data.frame, proto.btw.cos))
+
+# Create dataframe
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mumID= as.character("pouit"), troop.nb.s=1,scan.nb.s=1, NDVI.s=1, rank.s=1)
+
+names.of.ind<- unique(cos.btw.s2$ID)
+
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-cos.btw.s2 %>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s),length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,3], cohort=df.sub2[1,8], sex=df.sub2[1,9], mumID= as.character(df.sub2[1,14]),  troop.nb.s=proto.cos.btw[1,10], scan.nb.s=proto.cos.btw[1,8], NDVI.s=proto.cos.btw[1,9], rank.s=proto.cos.btw[1,11])
+  
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mumID<-as.character(df.pred$mumID)
+
+df.pred<-df.pred%>%droplevels()
+
+# Predictions
+pred_cos_btw<- fitted(mod.btw.cos, newdata = df.pred, summary=F, scale=c("response"))
+
+
+# Back transform
+fitted.cos.btw<- as.data.frame(t(pred_cos_btw))
+pred.cos.btw<-cbind(df.pred,fitted.cos.btw) 
+
+mean_fitted_cos_btw<-aggregate(x = pred.cos.btw[,c(11:2010)], by = list(pred.cos.btw$age.s, pred.cos.btw$sex), FUN = mean)
+
+colnames(mean_fitted_cos_btw)[1]<-"age.s"
+colnames(mean_fitted_cos_btw)[2]<-"sex"
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.cos.btw<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_cos_btw)){
+  
+  temp.df$age.s<-mean_fitted_cos_btw[each,1]
+  temp.df$sex<-mean_fitted_cos_btw[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_cos_btw[each,3:2002]))
+  global.ci<-apply(mean_fitted_cos_btw[each,3:2002],1,HPDI, prob=0.95)
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.cos.btw <- rbind(df.fitted.mean.cos.btw, temp.df)
+}
+
+df.fitted.mean.cos.btw$age<-df.fitted.mean.cos.btw$age.s * attributes(cos.btw.f$age.s)$`scaled:scale` + attributes(cos.btw.f$age.s)$`scaled:center`
+
+df.fitted.mean.cos.btw$age<-(as.integer(df.fitted.mean.cos.btw$age))
+df.fitted.mean.cos.btw$sex<-as.factor(df.fitted.mean.cos.btw$sex)
+
+df.cos.btw.restricted <-df.fitted.mean.cos.btw%>%filter(age>224 & age<1200)
+
+fig.btw.cos<-ggplot(data=df.cos.btw.restricted, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+  geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.cos.btw.restricted, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs( x = "Age (days)", y = "Cosine similarity between spatial and grooming partners")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))+ theme(legend.position = "none",axis.text.x=element_text(size=13), axis.text.y=element_text(size=13), axis.title=element_text(size=14))#
+
+
+plot.raw.cos.btw<-ggplot() +
+  # raw plot
+  geom_point(data=cos.btw.f, aes(x=age, y=cosine),color="lightgrey", size=0.8) + 
+  # predicted plot
+  geom_line(data=df.cos.btw.restricted, aes(x=age, y=mean, color=sex), size=1)+
+  geom_ribbon(data=df.cos.btw.restricted, aes(x=age, y=mean,ymin=lci, ymax=uci, fill=sex),color=NA, alpha=0.5)+ theme_classic() +  labs( x = "Age (days)", y = "Cosine similarity")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue"))
+```
+
+## Cosine between mother's and offspring's grooming partners
+
+```{r}
+proto.gr.cos.mumoff <- conditional_effects(mod.cos.mumoff, 'age.s:sex', plot=FALSE)
+proto.cos.mumoff<- as.data.frame(do.call(rbind.data.frame, proto.gr.cos.mumoff))
+
+# Create storage
+df.pred<- data.frame(age.s = -1.582302, ID= as.character("disn"), troop="PT",cohort= "2013", sex=1, mum= as.character("pouit"), troop.nb.s=1,scan.nb.s=1, NDVI.s=1, rank.s=1)
+
+names.of.ind<- unique(cos.gr.mum.off.s2$ID)
+
+for(i in 1:length(names.of.ind)){
+  
+  df.sub2<-cos.gr.mum.off.s2%>% filter(ID==as.character(names.of.ind[i]))
+  
+  df.temp <- data.frame(age.s=seq(from=min(df.sub2$age.s), to= max(df.sub2$age.s),length.out=100), ID=as.character(names.of.ind[i]),troop = df.sub2[1,"troop"], cohort=df.sub2[1,"cohort"], sex=df.sub2[1, "sex"], mum= as.character(df.sub2[1,"mum"]),  troop.nb.s=proto.cos.mumoff[1,"troop.nb.s"], scan.nb.s=proto.cos.mumoff[1,"scan.nb.s"], NDVI.s=proto.cos.mumoff[1,"NDVI.s"], rank.s=proto.cos.mumoff[1,"rank.s"])
+  
+  df.pred <- rbind(df.pred, df.temp)
+}
+
+df.pred<- df.pred[-1,]
+df.pred$age.s<-round(df.pred$age.s, digits=1)
+df.pred$ID<-as.character(df.pred$ID)
+df.pred$mum<-as.character(df.pred$mum)
+
+df.pred<-df.pred%>%droplevels()
+
+# Make predictions
+pred_cos_mumoff<- fitted(mod.cos.mumoff, newdata = df.pred, summary=F, scale=c("response"))
+
+# Back transform
+fitted.cos.mumoff <- as.data.frame(t(pred_cos_mumoff))
+pred.cos.mumoff <-cbind(df.pred,fitted.cos.mumoff) 
+
+mean_fitted_cos_mumoff<-aggregate(x = pred.cos.mumoff[,c(11:2010)], by = list(pred.cos.mumoff$age.s, pred.cos.mumoff$sex), FUN = mean)
+
+colnames(mean_fitted_cos_mumoff)[1]<-"age.s"
+colnames(mean_fitted_cos_mumoff)[2]<-"sex"
+
+# get the mean of the iteration average 
+temp.df<-data.frame(age.s=1, sex=1, mean=1, lci=1, uci=1)
+df.fitted.mean.cos.mumoff<-data.frame()
+
+for ( each in 1:nrow(mean_fitted_cos_mumoff)){
+  
+  temp.df$age.s<-mean_fitted_cos_mumoff[each,1]
+  temp.df$sex<-mean_fitted_cos_mumoff[each,2]
+  temp.df$mean<-mean(as.numeric(mean_fitted_cos_mumoff[each,3:2002]))
+  global.ci<-apply(mean_fitted_cos_mumoff[each,3:2002],1,HPDI, prob=0.95)
+  temp.df$lci<- global.ci[1,]
+  temp.df$uci<- global.ci[2,]
+  
+  df.fitted.mean.cos.mumoff <- rbind(df.fitted.mean.cos.mumoff, temp.df)
+}
+
+df.fitted.mean.cos.mumoff$age<-df.fitted.mean.cos.mumoff$age.s * attributes(cos.gr.mum.off.f$age.s)$`scaled:scale` + attributes(cos.gr.mum.off.f$age.s)$`scaled:center`
+
+df.fitted.mean.cos.mumoff$age<-(as.integer(df.fitted.mean.cos.mumoff$age))
+df.fitted.mean.cos.mumoff$sex<-as.factor(df.fitted.mean.cos.mumoff$sex)
+
+df.cos.mumoff <-df.fitted.mean.cos.mumoff%>%filter(age>224)
+
+cosine.gr.fig.w<-ggplot(data=df.cos.mumoff, aes(x=age, y=mean, group=sex, color=sex))+geom_rect(data=NULL,aes(xmin=350,xmax=440,ymin=-Inf,ymax=Inf),fill="lightgrey", color=NA)+  geom_rect(data=NULL,aes(xmin=715,xmax=805,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+ geom_rect(data=NULL,aes(xmin=1080,xmax=1170,ymin=-Inf,ymax=Inf),fill="lightgrey",color=NA)+geom_line()+ geom_ribbon(data=df.cos.mumoff, aes(ymin=lci, ymax=uci, group=sex, fill=sex),color=NA, alpha=0.5)+theme_classic() +  labs( x = "Age (days)", y = "Cosine similarity in grooming weak ties")+ guides(fill = FALSE)+ labs(color = "Sex") + scale_color_manual(labels = c("Males", "Females"), values = c("red", "blue")) +ylim(0.6,1)+ theme(legend.position = "none",axis.text.x=element_text(size=11), axis.text.y=element_text(size=11), axis.title=element_text(size=11))
+```
